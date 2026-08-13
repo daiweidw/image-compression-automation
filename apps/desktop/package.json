@@ -1,0 +1,20 @@
+{
+  "name": "@ica/desktop",
+  "version": "0.2.3",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsup --config tsup.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ica/contracts": "workspace:*",
+    "@ica/server": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "electron": "^43.4.0",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,29 +1,38 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { TransformComponent, TransformWrapper } from "react-zoom-pan-pinch";
 import {
   AlertCircle,
   Check,
-  ChevronLeft,
-  ChevronRight,
   CircleGauge,
+  Columns2,
   Eye,
   EyeOff,
   FolderInput,
   FolderOutput,
+  FolderSearch,
+  History,
   Image as ImageIcon,
   KeyRound,
   LoaderCircle,
+  Maximize2,
+  Pause,
+  Play,
   Power,
   RefreshCw,
   RotateCcw,
   Search,
   Settings,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
-  X
+  X,
+  ZoomIn,
+  ZoomOut
 } from "lucide-react";
-import type { ApplicationStatus, ImageItem, ImageListResponse, ImageStatus, JobView, ScanState, SettingsResponse, ShutdownResponse, UpdateSettingsRequest } from "@ica/contracts";
+import type { ApplicationStatus, DesktopCapabilities, ImageItem, ImageListResponse, ImageStatus, JobHistoryResponse, JobView, ScanState, SettingsResponse, ShutdownResponse, UpdateSettingsRequest, WatchState } from "@ica/contracts";
 import { api, ApiError } from "./lib/api";
 
 const statusLabels: Record<ImageStatus, string> = {
@@ -68,12 +77,15 @@ function ErrorBanner({ error, onClose }: { error: unknown; onClose: () => void }
   );
 }
 
-function SettingsPanel({ settings, onClose, onRequestShutdown }: { settings: SettingsResponse; onClose?: () => void; onRequestShutdown: () => void }) {
+function SettingsPanel({ settings, capabilities, onClose, onRequestShutdown }: { settings: SettingsResponse; capabilities: DesktopCapabilities; onClose?: () => void; onRequestShutdown: () => void }) {
   const queryClient = useQueryClient();
   const [sourceDir, setSourceDir] = useState(settings.sourceDir);
   const [outputDir, setOutputDir] = useState(settings.outputDir);
   const [recursive, setRecursive] = useState(settings.recursive);
   const [concurrency, setConcurrency] = useState(settings.compressionConcurrency);
+  const [watchEnabled, setWatchEnabled] = useState(settings.watchEnabled);
+  const [autoCompress, setAutoCompress] = useState(settings.autoCompress);
+  const [conflictStrategy, setConflictStrategy] = useState(settings.conflictStrategy);
   const [key, setKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [createOutputDir, setCreateOutputDir] = useState(false);
@@ -87,6 +99,9 @@ function SettingsPanel({ settings, onClose, onRequestShutdown }: { settings: Set
         outputDir,
         recursive,
         compressionConcurrency: concurrency,
+        watchEnabled,
+        autoCompress,
+        conflictStrategy,
         createOutputDir,
         apiKeyAction: key.trim() ? "replace" : "keep",
         apiKey: key.trim() || null
@@ -123,6 +138,15 @@ function SettingsPanel({ settings, onClose, onRequestShutdown }: { settings: Set
     },
     onError: setError
   });
+  const chooseDirectory = useMutation({
+    mutationFn: ({ kind, currentPath }: { kind: "source" | "output"; currentPath: string }) => api<{ path: string | null }>("/api/platform/choose-directory", { method: "POST", body: JSON.stringify({ kind, currentPath }) }),
+    onSuccess: (result, variables) => {
+      if (!result.path) return;
+      if (variables.kind === "source") setSourceDir(result.path);
+      else { setOutputDir(result.path); setCreateOutputDir(false); }
+    },
+    onError: setError
+  });
 
   return (
     <div className={onClose ? "modal-backdrop" : "setup-page"}>
@@ -142,16 +166,25 @@ function SettingsPanel({ settings, onClose, onRequestShutdown }: { settings: Set
           <div className="form-section-title"><FolderInput size={18} /><span>文件夹</span></div>
           <label>
             <span>原图目录</span>
-            <input value={sourceDir} onChange={(event) => setSourceDir(event.target.value)} placeholder="/Users/你的名字/Pictures/source" />
+            <div className="directory-field"><input value={sourceDir} onChange={(event) => setSourceDir(event.target.value)} placeholder="/Users/你的名字/Pictures/source" />{capabilities.nativeDirectoryPicker && <button className="secondary-button" onClick={() => chooseDirectory.mutate({ kind: "source", currentPath: sourceDir })}><FolderSearch size={16} />选择</button>}</div>
           </label>
           <label>
             <span>压缩结果目录</span>
-            <input value={outputDir} onChange={(event) => { setOutputDir(event.target.value); setCreateOutputDir(false); }} placeholder="/Users/你的名字/Pictures/output" />
+            <div className="directory-field"><input value={outputDir} onChange={(event) => { setOutputDir(event.target.value); setCreateOutputDir(false); }} placeholder="/Users/你的名字/Pictures/output" />{capabilities.nativeDirectoryPicker && <button className="secondary-button" onClick={() => chooseDirectory.mutate({ kind: "output", currentPath: outputDir })}><FolderSearch size={16} />选择</button>}</div>
           </label>
           <div className="inline-settings">
             <label className="check-label"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span>扫描子目录</span></label>
             <label className="compact-field"><span>同时压缩</span><select value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))}>{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value} 张</option>)}</select></label>
           </div>
+          <div className="settings-options">
+            <label className="check-label"><input type="checkbox" checked={watchEnabled} onChange={(event) => { setWatchEnabled(event.target.checked); if (!event.target.checked) setAutoCompress(false); }} /><span>自动监听原图目录</span></label>
+            <label className="check-label"><input type="checkbox" checked={autoCompress} disabled={!watchEnabled} onChange={(event) => setAutoCompress(event.target.checked)} /><span>自动压缩新增图片</span></label>
+          </div>
+          {autoCompress && <div className="warning-note"><AlertCircle size={15} /><span>新增图片会自动上传到 TinyPNG，并消耗你的 API 次数。</span></div>}
+          <label>
+            <span>结果文件冲突时</span>
+            <select value={conflictStrategy} onChange={(event) => setConflictStrategy(event.target.value as SettingsResponse["conflictStrategy"])}><option value="overwrite">覆盖本工具生成的结果</option><option value="skip">跳过已有文件</option><option value="suffix">添加 compressed 后缀</option></select>
+          </label>
         </div>
 
         <div className="form-section">
@@ -163,7 +196,7 @@ function SettingsPanel({ settings, onClose, onRequestShutdown }: { settings: Set
               <button className="icon-button" onClick={() => setShowKey((value) => !value)} title={showKey ? "隐藏 API Key" : "显示 API Key"}>{showKey ? <EyeOff size={18} /> : <Eye size={18} />}</button>
             </div>
           </label>
-          <div className="security-note"><ShieldCheck size={16} /><span>Key 仅保存到本机后端，不会返回浏览器。图片压缩时会上传至 TinyPNG。</span></div>
+          <div className="security-note"><ShieldCheck size={16} /><span>{capabilities.encryptedSecretStorage ? "Key 已由 macOS 系统安全存储加密，不会返回页面。" : "Key 仅保存到本机后端，不会返回浏览器。"} 图片压缩时会上传至 TinyPNG。</span></div>
           <div className="key-actions">
             <button className="secondary-button" onClick={() => test.mutate()} disabled={test.isPending || (!key.trim() && !settings.apiKey.configured)}>{test.isPending ? <LoaderCircle className="spin" size={16} /> : <CircleGauge size={16} />}测试连接</button>
             {settings.apiKey.configured && <button className="danger-text-button" onClick={() => window.confirm("确定删除已保存的 API Key？") && removeKey.mutate()} disabled={removeKey.isPending}><Trash2 size={16} />删除 Key</button>}
@@ -225,64 +258,92 @@ function StatusPill({ status }: { status: ImageStatus }) {
   return <span className={`status-pill status-${status}`}>{statusLabels[status]}</span>;
 }
 
-function PreviewDialog({ image, onClose }: { image: ImageItem; onClose: () => void }) {
+function PreviewDialog({ image, capabilities, onClose }: { image: ImageItem; capabilities: DesktopCapabilities; onClose: () => void }) {
+  const [mode, setMode] = useState<"slider" | "side-by-side">("slider");
+  const [position, setPosition] = useState(50);
+  const reveal = useMutation({ mutationFn: (variant: "source" | "output") => api("/api/platform/reveal-image", { method: "POST", body: JSON.stringify({ imageId: image.id, variant }) }) });
+  const hasOutput = image.status === "compressed";
+  const sourceUrl = `/api/images/${image.id}/preview?variant=source`;
+  const outputUrl = `/api/images/${image.id}/preview?variant=output`;
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <section className="preview-panel">
-        <header className="panel-header"><div><span className="eyebrow">图片预览</span><h2>{image.filename}</h2></div><button className="icon-button" onClick={onClose} title="关闭预览"><X size={20} /></button></header>
-        <div className={`preview-grid ${image.status !== "compressed" ? "single" : ""}`}>
-          <figure><div className="preview-image-wrap"><img src={`/api/images/${image.id}/preview?variant=source`} alt={`${image.filename} 原图`} /></div><figcaption><span>原图</span><strong>{formatBytes(image.sourceSize)}</strong></figcaption></figure>
-          {image.status === "compressed" && <figure><div className="preview-image-wrap"><img src={`/api/images/${image.id}/preview?variant=output`} alt={`${image.filename} 压缩结果`} /></div><figcaption><span>压缩结果</span><strong>{formatBytes(image.outputSize)}</strong></figcaption></figure>}
-        </div>
+        <header className="panel-header"><div><span className="eyebrow">效果对比</span><h2>{image.filename}</h2></div><div className="preview-actions">{hasOutput && <div className="segmented-control"><button className={mode === "slider" ? "active" : ""} onClick={() => setMode("slider")} title="滑块对比"><SlidersHorizontal size={16} /></button><button className={mode === "side-by-side" ? "active" : ""} onClick={() => setMode("side-by-side")} title="并排对比"><Columns2 size={16} /></button></div>}<button className="icon-button" onClick={onClose} title="关闭预览"><X size={20} /></button></div></header>
+        <TransformWrapper initialScale={1} minScale={0.5} maxScale={4} centerOnInit wheel={{ step: 0.15 }}>
+          {({ zoomIn, zoomOut, resetTransform }) => <>
+            <div className="compare-toolbar"><button className="icon-button bordered" onClick={() => zoomOut()} title="缩小"><ZoomOut size={16} /></button><button className="icon-button bordered" onClick={() => zoomIn()} title="放大"><ZoomIn size={16} /></button><button className="icon-button bordered" onClick={() => resetTransform()} title="适应窗口"><Maximize2 size={16} /></button>{capabilities.revealInFinder && <><button className="secondary-button" onClick={() => reveal.mutate("source")}><FolderSearch size={15} />显示原图</button>{hasOutput && <button className="secondary-button" onClick={() => reveal.mutate("output")}><FolderOutput size={15} />显示结果</button>}</>}</div>
+            <TransformComponent wrapperClass="compare-transform" contentClass="compare-content">
+              {!hasOutput ? <div className="compare-single"><img src={sourceUrl} alt={`${image.filename} 原图`} /></div> : mode === "side-by-side" ? <div className="compare-side"><figure><img src={sourceUrl} alt={`${image.filename} 原图`} /><figcaption>原图</figcaption></figure><figure><img src={outputUrl} alt={`${image.filename} 压缩结果`} /><figcaption>压缩结果</figcaption></figure></div> : <div className="compare-slider"><img className="compare-base" src={sourceUrl} alt={`${image.filename} 原图`} /><div className="compare-overlay" style={{ width: `${position}%` }}><img src={outputUrl} alt={`${image.filename} 压缩结果`} /></div><div className="compare-divider" style={{ left: `${position}%` }} /><span className="compare-label source-label">原图</span><span className="compare-label output-label">压缩结果</span></div>}
+            </TransformComponent>
+          </>}
+        </TransformWrapper>
+        {hasOutput && mode === "slider" && <input className="compare-range" aria-label="对比位置" type="range" min="0" max="100" value={position} onChange={(event) => setPosition(Number(event.target.value))} />}
         <div className="preview-meta"><span>{image.relativePath}</span><span>{image.width && image.height ? `${image.width} × ${image.height}` : "尺寸未知"}</span><StatusPill status={image.status} /></div>
+        <div className="compare-stats"><div><span>原图</span><strong>{formatBytes(image.sourceSize)}</strong></div><div><span>压缩结果</span><strong>{formatBytes(image.outputSize)}</strong></div><div><span>节省</span><strong>{image.savedRatio == null ? "-" : `${(image.savedRatio * 100).toFixed(1)}%`}</strong></div><div><span>完成时间</span><strong>{formatTime(image.compressedAt)}</strong></div></div>
       </section>
     </div>
   );
 }
 
-function JobPanel({ jobs }: { jobs: JobView[] }) {
+function JobPanel({ jobs, onOpenHistory }: { jobs: JobView[]; onOpenHistory: () => void }) {
   const queryClient = useQueryClient();
   const cancel = useMutation({ mutationFn: (id: string) => api(`/api/jobs/${id}/cancel`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }) });
   const retry = useMutation({ mutationFn: (id: string) => api(`/api/job-items/${id}/retry`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries() });
+  const pause = useMutation({ mutationFn: (id: string) => api(`/api/jobs/${id}/pause`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }) });
+  const resume = useMutation({ mutationFn: (id: string) => api(`/api/jobs/${id}/resume`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }) });
   const latest = jobs[0];
-  if (!latest) return <aside className="job-panel empty-jobs"><Sparkles size={22} /><strong>暂无压缩任务</strong><span>选择图片后开始压缩</span></aside>;
+  if (!latest) return <aside className="job-panel empty-jobs"><Sparkles size={22} /><strong>暂无压缩任务</strong><span>选择图片后开始压缩</span><button className="secondary-button history-button" onClick={onOpenHistory}><History size={15} />任务历史</button></aside>;
   const complete = latest.succeeded + latest.failed + latest.cancelled + latest.skipped;
   return (
     <aside className="job-panel">
-      <div className="job-heading"><div><span className="eyebrow">最近任务</span><strong>{latest.status === "running" || latest.status === "queued" ? "正在处理" : "处理结果"}</strong></div><span>{complete}/{latest.total}</span></div>
+      <div className="job-heading"><div><span className="eyebrow">最近任务</span><strong>{latest.status === "paused" ? "已暂停" : latest.status === "awaiting_resume" ? "等待恢复" : latest.status === "running" || latest.status === "queued" ? "正在处理" : "处理结果"}</strong></div><button className="icon-button mini" onClick={onOpenHistory} title="任务历史"><History size={16} /></button><span>{complete}/{latest.total}</span></div>
       <div className="progress-track"><div style={{ width: `${latest.total ? (complete / latest.total) * 100 : 0}%` }} /></div>
       <div className="job-stats"><span className="success-dot">成功 {latest.succeeded}</span><span className="failure-dot">失败 {latest.failed}</span><span>节省 {formatBytes(Math.max(0, latest.inputBytes - latest.outputBytes))}</span></div>
       <div className="job-items">
         {latest.items.slice(0, 6).map((item) => <div className="job-item" key={item.id}><span className={`job-indicator job-${item.status}`}>{item.status === "running" ? <LoaderCircle className="spin" size={14} /> : item.status === "succeeded" ? <Check size={14} /> : item.status === "failed" ? <AlertCircle size={14} /> : <span />}</span><div><strong title={item.relativePath}>{item.filename}</strong><span>{item.status === "failed" ? item.errorMessage : item.status === "succeeded" ? `${formatBytes(item.inputSize)} → ${formatBytes(item.outputSize)}` : item.status === "running" ? "上传并压缩中" : "等待处理"}</span></div>{item.status === "failed" && <button className="icon-button mini" onClick={() => retry.mutate(item.id)} title="重试"><RotateCcw size={14} /></button>}</div>)}
       </div>
-      {(latest.status === "running" || latest.status === "queued") && <button className="secondary-button full" onClick={() => cancel.mutate(latest.id)}>取消排队任务</button>}
+      <div className="job-controls">{(latest.status === "running" || latest.status === "queued") && <button className="secondary-button" onClick={() => pause.mutate(latest.id)}><Pause size={14} />暂停</button>}{(latest.status === "paused" || latest.status === "awaiting_resume") && <button className="primary-button" onClick={() => resume.mutate(latest.id)}><Play size={14} />继续</button>}{["running", "queued", "paused", "awaiting_resume"].includes(latest.status) && <button className="secondary-button" onClick={() => cancel.mutate(latest.id)}>取消剩余</button>}</div>
     </aside>
   );
 }
 
-function Workspace({ settings, onOpenSettings, onRequestShutdown }: { settings: SettingsResponse; onOpenSettings: () => void; onRequestShutdown: () => void }) {
+function HistoryDialog({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient();
-  const [page, setPage] = useState(1);
+  const [status, setStatus] = useState("");
+  const [query, setQuery] = useState("");
+  const params = new URLSearchParams({ page: "1", pageSize: "100" });
+  if (status) params.set("status", status);
+  if (query) params.set("query", query);
+  const history = useQuery({ queryKey: ["job-history", status, query], queryFn: () => api<JobHistoryResponse>(`/api/jobs?${params}`) });
+  const resume = useMutation({ mutationFn: (id: string) => api(`/api/jobs/${id}/resume`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries() });
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="history-panel"><header className="panel-header"><div><span className="eyebrow">任务记录</span><h2>压缩历史</h2></div><button className="icon-button" onClick={onClose}><X size={20} /></button></header><div className="history-toolbar"><div className="search-field"><Search size={16} /><input placeholder="搜索图片名称" value={query} onChange={(event) => setQuery(event.target.value)} /></div><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">全部状态</option><option value="completed">已完成</option><option value="completed_with_errors">部分失败</option><option value="paused">已暂停</option><option value="awaiting_resume">等待恢复</option><option value="cancelled">已取消</option></select></div><div className="history-list">{history.data?.items.map((job) => <div className="history-row" key={job.id}><div><strong>{formatTime(job.createdAt)} · {job.total} 张</strong><span>成功 {job.succeeded} · 失败 {job.failed} · 节省 {formatBytes(Math.max(0, job.inputBytes - job.outputBytes))}</span></div><span className={`job-status job-status-${job.status}`}>{job.status === "completed" ? "已完成" : job.status === "completed_with_errors" ? "部分失败" : job.status === "awaiting_resume" ? "等待恢复" : job.status === "paused" ? "已暂停" : job.status === "cancelled" ? "已取消" : "处理中"}</span>{["paused", "awaiting_resume"].includes(job.status) && <button className="secondary-button" onClick={() => resume.mutate(job.id)}><Play size={14} />继续</button>}</div>)}{history.data?.items.length === 0 && <div className="history-empty">没有符合条件的任务</div>}</div></section></div>;
+}
+
+function Workspace({ settings, capabilities, onOpenSettings, onRequestShutdown }: { settings: SettingsResponse; capabilities: DesktopCapabilities; onOpenSettings: () => void; onRequestShutdown: () => void }) {
+  const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   const [format, setFormat] = useState("");
   const [sort, setSort] = useState("filename");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [preview, setPreview] = useState<ImageItem | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  const params = new URLSearchParams({ page: String(page), pageSize: "50", sort, order: sort === "filename" ? "asc" : "desc" });
+  const tableScrollRef = useRef<HTMLDivElement>(null);
+  const params = new URLSearchParams({ page: "1", pageSize: "5000", sort, order: sort === "filename" ? "asc" : "desc" });
   if (query) params.set("query", query);
   if (status) params.set("status", status);
   if (format) params.set("format", format);
 
-  const imagesQuery = useQuery({ queryKey: ["images", page, query, status, format, sort], queryFn: () => api<ImageListResponse>(`/api/images?${params}`), refetchInterval: 4000 });
+  const imagesQuery = useQuery({ queryKey: ["images", query, status, format, sort], queryFn: () => api<ImageListResponse>(`/api/images?${params}`), refetchInterval: 4000 });
   const scanQuery = useQuery({ queryKey: ["scan"], queryFn: () => api<ScanState>("/api/scans/current"), refetchInterval: (query) => query.state.data?.status === "running" ? 500 : 5000 });
-  const jobsQuery = useQuery({ queryKey: ["jobs"], queryFn: () => api<JobView[]>("/api/jobs"), refetchInterval: (query) => query.state.data?.some((job) => ["queued", "running"].includes(job.status)) ? 700 : 5000 });
+  const jobsQuery = useQuery({ queryKey: ["jobs"], queryFn: () => api<JobHistoryResponse>("/api/jobs?page=1&pageSize=10"), refetchInterval: (query) => query.state.data?.items.some((job) => ["queued", "running"].includes(job.status)) ? 700 : 5000 });
+  const watchQuery = useQuery({ queryKey: ["watch"], queryFn: () => api<WatchState>("/api/watch"), refetchInterval: 5000 });
   useEffect(() => {
     if (scanQuery.data?.status === "succeeded") void queryClient.invalidateQueries({ queryKey: ["images"] });
   }, [scanQuery.data?.status, scanQuery.data?.finishedAt, queryClient]);
   useEffect(() => {
-    if (jobsQuery.data?.some((job) => ["queued", "running"].includes(job.status))) void queryClient.invalidateQueries({ queryKey: ["images"] });
+    if (jobsQuery.data?.items.some((job) => ["queued", "running"].includes(job.status))) void queryClient.invalidateQueries({ queryKey: ["images"] });
   }, [jobsQuery.data, queryClient]);
   useEffect(() => {
     const events = new EventSource("/api/events");
@@ -305,10 +366,10 @@ function Workspace({ settings, onOpenSettings, onRequestShutdown }: { settings: 
     }
   });
   const images = imagesQuery.data?.items ?? [];
+  const rowVirtualizer = useVirtualizer({ count: images.length, getScrollElement: () => tableScrollRef.current, estimateSize: () => 64, overscan: 8 });
   const selectable = images.filter((item) => compressibleStatuses.has(item.status));
   const pageAllSelected = selectable.length > 0 && selectable.every((item) => selected.has(item.id));
   const togglePage = () => setSelected((current) => { const next = new Set(current); if (pageAllSelected) selectable.forEach((item) => next.delete(item.id)); else selectable.forEach((item) => next.add(item.id)); return next; });
-  const totalPages = Math.max(1, Math.ceil((imagesQuery.data?.total ?? 0) / 50));
   const summary = imagesQuery.data?.summary;
   const selectAllFiltered = async () => {
     try {
@@ -328,7 +389,7 @@ function Workspace({ settings, onOpenSettings, onRequestShutdown }: { settings: 
       <header className="topbar">
         <div className="brand"><div className="brand-mark"><ImageIcon size={22} /></div><div><strong>图片压缩工作台</strong><span>TinyPNG 本地管理</span></div></div>
         <div className="directory-context"><FolderInput size={16} /><span title={settings.sourceDir}>{settings.sourceDir}</span><span className="path-arrow">→</span><FolderOutput size={16} /><span title={settings.outputDir}>{settings.outputDir}</span></div>
-        <div className="top-actions"><button className="secondary-button" onClick={() => scan.mutate()} disabled={scan.isPending || scanQuery.data?.status === "running"}>{scanQuery.data?.status === "running" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}重新扫描</button><button className="icon-button bordered" onClick={onOpenSettings} title="设置" aria-label="设置"><Settings size={19} /></button><button className="icon-button bordered exit-button" onClick={onRequestShutdown} title="退出应用" aria-label="退出应用"><Power size={19} /></button></div>
+        <div className="top-actions"><span className={`watch-badge ${watchQuery.data?.watching ? "active" : ""}`} title={watchQuery.data?.lastError ?? "目录监听状态"}>{watchQuery.data?.watching ? <><span className="watch-dot" />自动监听</> : "手动刷新"}</span>{capabilities.revealInFinder && <button className="icon-button bordered" onClick={() => api("/api/platform/reveal-directory", { method: "POST", body: JSON.stringify({ kind: "output" }) })} title="打开结果目录"><FolderOutput size={18} /></button>}<button className="secondary-button" onClick={() => scan.mutate()} disabled={scan.isPending || scanQuery.data?.status === "running"}>{scanQuery.data?.status === "running" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}重新扫描</button><button className="icon-button bordered" onClick={onOpenSettings} title="设置" aria-label="设置"><Settings size={19} /></button><button className="icon-button bordered exit-button" onClick={onRequestShutdown} title="退出应用" aria-label="退出应用"><Power size={19} /></button></div>
       </header>
 
       <main className="workspace-layout">
@@ -344,38 +405,41 @@ function Workspace({ settings, onOpenSettings, onRequestShutdown }: { settings: 
           </div>
 
           <div className="list-toolbar">
-            <div className="search-field"><Search size={17} /><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="搜索文件名或路径" /></div>
-            <select aria-label="状态筛选" value={status} onChange={(event) => { setStatus(event.target.value); setPage(1); }}><option value="">全部状态</option>{Object.entries(statusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-            <select aria-label="格式筛选" value={format} onChange={(event) => { setFormat(event.target.value); setPage(1); }}><option value="">全部格式</option><option value="png">PNG</option><option value="jpg,jpeg">JPEG</option><option value="webp">WebP</option><option value="avif">AVIF</option></select>
+            <div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名或路径" /></div>
+            <select aria-label="状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">全部状态</option>{Object.entries(statusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
+            <select aria-label="格式筛选" value={format} onChange={(event) => setFormat(event.target.value)}><option value="">全部格式</option><option value="png">PNG</option><option value="jpg,jpeg">JPEG</option><option value="webp">WebP</option><option value="avif">AVIF</option></select>
             <select aria-label="排序" value={sort} onChange={(event) => setSort(event.target.value)}><option value="filename">文件名</option><option value="sourceSize">文件大小</option><option value="sourceMtime">更新时间</option><option value="compressedAt">压缩时间</option><option value="savedRatio">节省比例</option></select>
           </div>
 
           {(selected.size > 0 || selectable.length > 0) && <div className="selection-bar"><span>已选择 <strong>{selected.size}</strong> 张</span><button className="text-button" onClick={() => void selectAllFiltered()}>选择全部筛选结果</button>{selected.size > 0 && <button className="text-button" onClick={() => setSelected(new Set())}>清空</button>}<button className="primary-button" onClick={() => compress.mutate(false)} disabled={selected.size === 0 || compress.isPending || !settings.apiKey.configured}>{compress.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}压缩所选图片</button></div>}
 
-          <div className="table-wrap">
+          <div className="table-wrap virtual-table-wrap" ref={tableScrollRef}>
             <table className="image-table">
               <thead><tr><th className="select-column"><input type="checkbox" checked={pageAllSelected} onChange={togglePage} aria-label="选择当前页可压缩图片" /></th><th>图片</th><th>状态</th><th>原图</th><th>压缩结果</th><th>节省</th><th>更新时间</th></tr></thead>
-              <tbody>
+              <tbody style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
                 {imagesQuery.isLoading && <tr><td colSpan={7} className="empty-table"><LoaderCircle className="spin" size={24} />正在读取图片</td></tr>}
                 {!imagesQuery.isLoading && images.length === 0 && <tr><td colSpan={7} className="empty-table"><ImageIcon size={28} /><strong>目录中没有可显示的图片</strong><span>放入 PNG、JPEG、WebP 或 AVIF 后重新扫描</span></td></tr>}
-                {images.map((image) => {
+                {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                  const image = images[virtualRow.index]!;
                   const canSelect = compressibleStatuses.has(image.status);
-                  return <tr key={image.id} className={selected.has(image.id) ? "selected-row" : ""}><td><input type="checkbox" aria-label={`选择 ${image.filename}`} disabled={!canSelect} checked={selected.has(image.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(image.id)) next.delete(image.id); else next.add(image.id); return next; })} /></td><td><button className="image-cell" onClick={() => setPreview(image)}><img src={`/api/images/${image.id}/thumbnail`} alt="" loading="lazy" /><span><strong title={image.filename}>{image.filename}</strong><small title={image.relativePath}>{image.relativePath}</small></span></button></td><td><StatusPill status={image.status} />{image.errorMessage && <span className="row-error" title={image.errorMessage}><AlertCircle size={14} /></span>}</td><td><strong>{formatBytes(image.sourceSize)}</strong><small>{image.width && image.height ? `${image.width} × ${image.height}` : image.extension.toUpperCase()}</small></td><td><strong>{formatBytes(image.outputSize)}</strong><small>{formatTime(image.compressedAt)}</small></td><td>{image.savedRatio == null ? <span className="muted">-</span> : <strong className="saved-value">-{(image.savedRatio * 100).toFixed(1)}%</strong>}</td><td><span className="muted">{formatTime(image.sourceMtime)}</span></td></tr>;
+                  return <tr key={image.id} data-index={virtualRow.index} style={{ transform: `translateY(${virtualRow.start}px)` }} className={selected.has(image.id) ? "selected-row" : ""}><td><input type="checkbox" aria-label={`选择 ${image.filename}`} disabled={!canSelect} checked={selected.has(image.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(image.id)) next.delete(image.id); else next.add(image.id); return next; })} /></td><td><button className="image-cell" onClick={() => setPreview(image)}><img src={`/api/images/${image.id}/thumbnail`} alt="" loading="lazy" /><span><strong title={image.filename}>{image.filename}</strong><small title={image.relativePath}>{image.relativePath}</small></span></button></td><td><StatusPill status={image.status} />{image.errorMessage && <span className="row-error" title={image.errorMessage}><AlertCircle size={14} /></span>}</td><td><strong>{formatBytes(image.sourceSize)}</strong><small>{image.width && image.height ? `${image.width} × ${image.height}` : image.extension.toUpperCase()}</small></td><td><strong>{formatBytes(image.outputSize)}</strong><small>{formatTime(image.compressedAt)}</small></td><td>{image.savedRatio == null ? <span className="muted">-</span> : <strong className="saved-value">-{(image.savedRatio * 100).toFixed(1)}%</strong>}</td><td><span className="muted">{formatTime(image.sourceMtime)}</span></td></tr>;
                 })}
               </tbody>
             </table>
           </div>
-          <footer className="pagination"><span>共 {imagesQuery.data?.total ?? 0} 张</span><div><button className="icon-button bordered" disabled={page <= 1} onClick={() => setPage((value) => value - 1)} title="上一页"><ChevronLeft size={17} /></button><span>{page} / {totalPages}</span><button className="icon-button bordered" disabled={page >= totalPages} onClick={() => setPage((value) => value + 1)} title="下一页"><ChevronRight size={17} /></button></div></footer>
+          <footer className="pagination"><span>共 {imagesQuery.data?.total ?? 0} 张</span><span>虚拟列表已启用</span></footer>
         </section>
-        <JobPanel jobs={jobsQuery.data ?? []} />
+        <JobPanel jobs={jobsQuery.data?.items ?? []} onOpenHistory={() => setHistoryOpen(true)} />
       </main>
-      {preview && <PreviewDialog image={preview} onClose={() => setPreview(null)} />}
+      {preview && <PreviewDialog image={preview} capabilities={capabilities} onClose={() => setPreview(null)} />}
+      {historyOpen && <HistoryDialog onClose={() => setHistoryOpen(false)} />}
     </div>
   );
 }
 
 export function App() {
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: () => api<SettingsResponse>("/api/settings") });
+  const capabilitiesQuery = useQuery({ queryKey: ["capabilities"], queryFn: () => api<DesktopCapabilities>("/api/platform/capabilities"), staleTime: Infinity });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shutdownStatus, setShutdownStatus] = useState<ApplicationStatus | null>(null);
   const [shutdownPhase, setShutdownPhase] = useState<"idle" | "stopping" | "stopped">("idle");
@@ -405,12 +469,12 @@ export function App() {
   });
   const requestShutdown = () => shutdownStatusMutation.mutate();
   if (shutdownPhase !== "idle") return <ShutdownState stopped={shutdownPhase === "stopped"} />;
-  if (settingsQuery.isLoading) return <div className="full-loading"><div className="brand-mark"><ImageIcon size={24} /></div><LoaderCircle className="spin" size={22} /><span>正在启动本地工作台</span></div>;
+  if (settingsQuery.isLoading || capabilitiesQuery.isLoading) return <div className="full-loading"><div className="brand-mark"><ImageIcon size={24} /></div><LoaderCircle className="spin" size={22} /><span>正在启动本地工作台</span></div>;
   if (settingsQuery.error || !settingsQuery.data) return <div className="fatal-state"><AlertCircle size={30} /><h1>无法连接本地服务</h1><p>{settingsQuery.error instanceof Error ? settingsQuery.error.message : "请重新启动应用"}</p></div>;
   return <>
     {!settingsQuery.data.configured
-      ? <SettingsPanel settings={settingsQuery.data} onRequestShutdown={requestShutdown} />
-      : <><Workspace settings={settingsQuery.data} onOpenSettings={() => setSettingsOpen(true)} onRequestShutdown={requestShutdown} />{settingsOpen && <SettingsPanel settings={settingsQuery.data} onClose={() => setSettingsOpen(false)} onRequestShutdown={requestShutdown} />}</>}
+      ? <SettingsPanel settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} onRequestShutdown={requestShutdown} />
+      : <><Workspace settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} onOpenSettings={() => setSettingsOpen(true)} onRequestShutdown={requestShutdown} />{settingsOpen && <SettingsPanel settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} onClose={() => setSettingsOpen(false)} onRequestShutdown={requestShutdown} />}</>}
     {shutdownStatus && <ShutdownDialog
       status={shutdownStatus}
       pending={shutdownMutation.isPending}

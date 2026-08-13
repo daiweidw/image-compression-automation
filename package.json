@@ -1,15 +1,20 @@
 {
   "name": "image-compression-automation",
-  "version": "0.1.0",
+  "version": "0.2.3",
+  "description": "在 macOS 本地管理和批量压缩 TinyPNG 图片的桌面工作台",
+  "author": "Image Compression Automation",
   "private": true,
   "type": "module",
+  "main": "apps/desktop/dist/main.js",
   "engines": {
     "node": ">=22"
   },
   "packageManager": "pnpm@10.12.1",
   "scripts": {
     "dev": "concurrently -k -n server,web -c cyan,green \"pnpm --filter @ica/server dev\" \"pnpm --filter @ica/web dev\"",
-    "build": "pnpm --filter @ica/web build && pnpm --filter @ica/server build",
+    "build": "pnpm --filter @ica/web build && pnpm --filter @ica/server build && pnpm --filter @ica/desktop build",
+    "desktop": "pnpm build && electron apps/desktop/dist/main.js",
+    "package:mac:arm64": "pnpm build && node scripts/package-mac-arm64-offline.mjs",
     "start": "pnpm --filter @ica/server start",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm --filter @ica/server test",
@@ -17,14 +22,51 @@
     "lint": "eslint .",
     "format": "prettier --write ."
   },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "sharp": "^0.34.3"
+  },
+  "optionalDependencies": {
+    "@img/sharp-darwin-arm64": "0.34.5",
+    "@img/sharp-libvips-darwin-arm64": "1.2.4"
+  },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
     "@playwright/test": "^1.54.2",
     "concurrently": "^9.2.0",
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3",
     "eslint": "^9.33.0",
     "eslint-plugin-react-hooks": "^5.2.0",
     "globals": "^16.3.0",
     "prettier": "^3.6.2",
+    "tsup": "^8.5.1",
     "typescript-eslint": "^8.39.1"
+  },
+  "build": {
+    "appId": "com.local.image-compression-automation",
+    "productName": "图片压缩工作台",
+    "asar": true,
+    "npmRebuild": true,
+    "directories": { "output": "release" },
+    "files": [
+      "apps/desktop/dist/**",
+      "apps/server/dist/**",
+      "apps/server/package.json",
+      "apps/desktop/package.json",
+      "packages/contracts/package.json",
+      "package.json",
+      "node_modules/**"
+    ],
+    "extraResources": [
+      { "from": "apps/web/dist", "to": "web" }
+    ],
+    "mac": {
+      "category": "public.app-category.graphics-design",
+      "target": ["zip"],
+      "identity": "-",
+      "hardenedRuntime": false,
+      "artifactName": "image-compression-workbench-${version}-mac-${arch}.${ext}"
+    }
   }
 }

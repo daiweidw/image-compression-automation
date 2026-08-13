@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ulid } from "ulid";
 
-export class FileSecretStore {
+export interface SecretStore {
+  hasTinyPngKey(): Promise<boolean>;
+  getTinyPngKey(): Promise<string | null>;
+  setTinyPngKey(value: string): Promise<void>;
+  deleteTinyPngKey(): Promise<void>;
+}
+
+export class FileSecretStore implements SecretStore {
   private readonly directory: string;
   private readonly keyPath: string;
 

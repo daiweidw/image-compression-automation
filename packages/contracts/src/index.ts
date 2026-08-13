@@ -11,9 +11,13 @@ export type ImageStatus =
 export type JobStatus =
   | "queued"
   | "running"
+  | "paused"
+  | "awaiting_resume"
   | "completed"
   | "completed_with_errors"
   | "cancelled";
+
+export type OutputConflictStrategy = "overwrite" | "skip" | "suffix";
 
 export interface ApiKeyState {
   configured: boolean;
@@ -28,6 +32,9 @@ export interface SettingsResponse {
   outputDir: string;
   recursive: boolean;
   compressionConcurrency: number;
+  watchEnabled: boolean;
+  autoCompress: boolean;
+  conflictStrategy: OutputConflictStrategy;
   apiKey: ApiKeyState;
 }
 
@@ -36,6 +43,9 @@ export interface UpdateSettingsRequest {
   outputDir: string;
   recursive: boolean;
   compressionConcurrency: number;
+  watchEnabled: boolean;
+  autoCompress: boolean;
+  conflictStrategy: OutputConflictStrategy;
   createOutputDir: boolean;
   apiKeyAction: "keep" | "replace";
   apiKey?: string | null;
@@ -88,12 +98,13 @@ export interface JobItemView {
   imageId: string;
   filename: string;
   relativePath: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
+  status: "queued" | "running" | "paused" | "awaiting_resume" | "succeeded" | "failed" | "cancelled" | "skipped";
   inputSize: number | null;
   outputSize: number | null;
   savedBytes: number | null;
   errorCode: string | null;
   errorMessage: string | null;
+  attemptCount: number;
   startedAt: string | null;
   finishedAt: string | null;
 }
@@ -112,6 +123,29 @@ export interface JobView {
   startedAt: string | null;
   finishedAt: string | null;
   items: JobItemView[];
+}
+
+export interface JobHistoryResponse {
+  items: JobView[];
+  page: number;
+  pageSize: number;
+  total: number;
+}
+
+export interface WatchState {
+  enabled: boolean;
+  watching: boolean;
+  autoCompress: boolean;
+  pendingChanges: number;
+  lastEventAt: string | null;
+  lastError: string | null;
+}
+
+export interface DesktopCapabilities {
+  desktop: boolean;
+  nativeDirectoryPicker: boolean;
+  revealInFinder: boolean;
+  encryptedSecretStorage: boolean;
 }
 
 export interface ApplicationStatus {

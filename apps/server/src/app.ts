@@ -1,11 +1,13 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import sharp from "sharp";
 import { z } from "zod";
 import type Database from "better-sqlite3";
-import type { ApplicationStatus } from "@ica/contracts";
+import type { ApplicationStatus, DesktopCapabilities } from "@ica/contracts";
 import { AppError } from "./errors.js";
 import { getWebDistDir } from "./paths.js";
 import { SettingsService } from "./application/settings-service.js";
@@ -13,6 +15,13 @@ import { ScannerService } from "./application/scanner-service.js";
 import { ImageService } from "./application/image-service.js";
 import { JobService } from "./application/job-service.js";
 import { ApplicationLifecycle } from "./application/application-lifecycle.js";
+import { WatchService } from "./application/watch-service.js";
+
+export interface PlatformIntegration {
+  capabilities: DesktopCapabilities;
+  chooseDirectory?: (kind: "source" | "output", currentPath: string) => Promise<string | null>;
+  revealPath?: (targetPath: string) => Promise<void>;
+}
 
 export interface AppServices {
   db: Database.Database;
@@ -20,6 +29,7 @@ export interface AppServices {
   scanner: ScannerService;
   images: ImageService;
   jobs: JobService;
+  watch?: WatchService;
 }
 
 const updateSettingsSchema = z.object({
@@ -27,6 +37,9 @@ const updateSettingsSchema = z.object({
   outputDir: z.string().min(1),
   recursive: z.boolean(),
   compressionConcurrency: z.number().int().min(1).max(5),
+  watchEnabled: z.boolean(),
+  autoCompress: z.boolean(),
+  conflictStrategy: z.enum(["overwrite", "skip", "suffix"]),
   createOutputDir: z.boolean(),
   apiKeyAction: z.enum(["keep", "replace"]),
   apiKey: z.string().nullable().optional()
@@ -36,7 +49,7 @@ const imageStatuses = ["pending", "queued", "compressing", "compressed", "source
 
 export async function buildApp(
   services: AppServices,
-  options: { production?: boolean; lifecycle?: ApplicationLifecycle } = {}
+  options: { production?: boolean; lifecycle?: ApplicationLifecycle; platform?: PlatformIntegration; webRoot?: string; thumbnailCacheDir?: string } = {}
 ) {
   const token = crypto.randomBytes(32).toString("base64url");
   const eventClients = new Set<NodeJS.WritableStream>();
@@ -44,6 +57,7 @@ export async function buildApp(
     const payload = `data: ${JSON.stringify({ type, entityId: entityId ?? null, occurredAt: new Date().toISOString() })}\n\n`;
     for (const client of eventClients) client.write(payload);
   };
+  const defaultCapabilities: DesktopCapabilities = { desktop: false, nativeDirectoryPicker: false, revealInFinder: false, encryptedSecretStorage: false };
   services.jobs.setOnChange((jobId) => publish("job.changed", jobId));
   const app = Fastify({
     logger: {
@@ -107,6 +121,26 @@ export async function buildApp(
     shuttingDown: options.lifecycle?.getStatus().shuttingDown ?? false
   }));
   app.get("/api/session", async (request) => ok(request, { token }));
+  app.get("/api/platform/capabilities", async (request) => ok(request, options.platform?.capabilities ?? defaultCapabilities));
+  app.post("/api/platform/choose-directory", async (request) => {
+    if (!options.platform?.chooseDirectory) throw new AppError("NATIVE_FEATURE_UNAVAILABLE", "当前运行模式不支持系统目录选择器", 409);
+    const body = z.object({ kind: z.enum(["source", "output"]), currentPath: z.string().default("") }).parse(request.body ?? {});
+    return ok(request, { path: await options.platform.chooseDirectory(body.kind, body.currentPath) });
+  });
+  app.post("/api/platform/reveal-image", async (request) => {
+    if (!options.platform?.revealPath) throw new AppError("NATIVE_FEATURE_UNAVAILABLE", "当前运行模式不支持 Finder", 409);
+    const body = z.object({ imageId: z.string(), variant: z.enum(["source", "output"]) }).parse(request.body);
+    const media = await services.images.previewPath(body.imageId, body.variant);
+    await options.platform.revealPath(media.path);
+    return ok(request, { revealed: true });
+  });
+  app.post("/api/platform/reveal-directory", async (request) => {
+    if (!options.platform?.revealPath) throw new AppError("NATIVE_FEATURE_UNAVAILABLE", "当前运行模式不支持 Finder", 409);
+    const body = z.object({ kind: z.enum(["source", "output"]) }).parse(request.body);
+    const settings = await services.settings.getResponse();
+    await options.platform.revealPath(body.kind === "source" ? settings.sourceDir : settings.outputDir);
+    return ok(request, { revealed: true });
+  });
   app.get("/api/application/status", async (request) => {
     const status: ApplicationStatus = options.lifecycle?.getStatus() ?? {
       shuttingDown: false,
@@ -144,11 +178,15 @@ export async function buildApp(
       outputDir: body.outputDir,
       recursive: body.recursive,
       compressionConcurrency: body.compressionConcurrency,
+      watchEnabled: body.watchEnabled,
+      autoCompress: body.autoCompress,
+      conflictStrategy: body.conflictStrategy,
       createOutputDir: body.createOutputDir,
       apiKeyAction: body.apiKeyAction,
       ...(body.apiKey !== undefined ? { apiKey: body.apiKey } : {})
     });
     services.scanner.start("incremental");
+    await services.watch?.sync();
     publish("settings.changed");
     return ok(request, result);
   });
@@ -168,11 +206,12 @@ export async function buildApp(
     return ok(request, result);
   });
   app.get("/api/scans/current", async (request) => ok(request, services.scanner.getCurrent()));
+  app.get("/api/watch", async (request) => ok(request, services.watch?.getState() ?? { enabled: false, watching: false, autoCompress: false, pendingChanges: 0, lastEventAt: null, lastError: null }));
 
   app.get("/api/images", async (request) => {
     const query = z.object({
       page: z.coerce.number().int().min(1).default(1),
-      pageSize: z.coerce.number().int().min(1).max(100).default(50),
+      pageSize: z.coerce.number().int().min(1).max(5000).default(50),
       query: z.string().optional(),
       status: z.string().optional(),
       format: z.string().optional(),
@@ -211,6 +250,21 @@ export async function buildApp(
     const { path: source, row } = await services.images.sourcePath(id);
     const etag = `"${row.source_hash}-256"`;
     if (request.headers["if-none-match"] === etag) return reply.status(304).send();
+    if (options.thumbnailCacheDir && row.source_hash) {
+      await fsp.mkdir(options.thumbnailCacheDir, { recursive: true, mode: 0o700 });
+      const cachePath = path.join(options.thumbnailCacheDir, `${row.source_hash}-256.webp`);
+      try {
+        await fsp.access(cachePath);
+      } catch {
+        const temporary = `${cachePath}.${process.pid}.tmp`;
+        await sharp(source).resize({ width: 256, height: 256, fit: "inside", withoutEnlargement: true }).webp({ quality: 78 }).toFile(temporary);
+        await fsp.rename(temporary, cachePath).catch(async (error) => {
+          await fsp.rm(temporary, { force: true });
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        });
+      }
+      return reply.header("Content-Type", "image/webp").header("Cache-Control", "private, max-age=31536000, immutable").header("ETag", etag).send(fs.createReadStream(cachePath));
+    }
     const buffer = await sharp(source).resize({ width: 256, height: 256, fit: "inside", withoutEnlargement: true }).webp({ quality: 78 }).toBuffer();
     return reply.header("Content-Type", "image/webp").header("Cache-Control", "private, max-age=31536000, immutable").header("ETag", etag).send(buffer);
   });
@@ -227,7 +281,10 @@ export async function buildApp(
     publish("job.changed", result.id);
     return ok(request, result);
   });
-  app.get("/api/jobs", async (request) => ok(request, services.jobs.list()));
+  app.get("/api/jobs", async (request) => {
+    const query = z.object({ page: z.coerce.number().int().min(1).default(1), pageSize: z.coerce.number().int().min(1).max(100).default(20), status: z.string().optional(), query: z.string().optional() }).parse(request.query);
+    return ok(request, services.jobs.list(query.page, query.pageSize, query.status, query.query));
+  });
   app.get("/api/jobs/:id", async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     return ok(request, services.jobs.get(id));
@@ -238,6 +295,14 @@ export async function buildApp(
     publish("job.changed", id);
     return ok(request, result);
   });
+  app.post("/api/jobs/:id/pause", async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    return ok(request, services.jobs.pause(id));
+  });
+  app.post("/api/jobs/:id/resume", async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    return ok(request, services.jobs.resume(id));
+  });
   app.post("/api/job-items/:id/retry", async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const result = await services.jobs.retryItem(id);
@@ -246,12 +311,19 @@ export async function buildApp(
   });
 
   if (options.production) {
-    const webRoot = getWebDistDir();
+    const webRoot = options.webRoot ?? getWebDistDir();
     await app.register(fastifyStatic, { root: webRoot, wildcard: false });
     app.setNotFoundHandler((request, reply) => {
       if (request.url.startsWith("/api/")) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "接口不存在" }, meta: { requestId: request.id } });
       return reply.header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'").sendFile("index.html");
     });
   }
+  Object.assign(app, { publish });
   return app;
+}
+
+declare module "fastify" {
+  interface FastifyInstance {
+    publish(type: string, entityId?: string): void;
+  }
 }

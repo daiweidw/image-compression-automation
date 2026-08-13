@@ -5,7 +5,7 @@ import type Database from "better-sqlite3";
 import { ulid } from "ulid";
 import type { JobView } from "@ica/contracts";
 import { AppError, errorMessage } from "../errors.js";
-import { FileSecretStore } from "../infrastructure/secret-store.js";
+import type { SecretStore } from "../infrastructure/secret-store.js";
 import type { TinyPngResult } from "../infrastructure/tinypng-adapter.js";
 import { OutputWriter } from "../infrastructure/output-writer.js";
 import { ImageService } from "./image-service.js";
@@ -34,7 +34,7 @@ export class JobService {
   constructor(
     private readonly db: Database.Database,
     private readonly images: ImageService,
-    private readonly secrets: FileSecretStore,
+    private readonly secrets: SecretStore,
     private readonly tinypng: CompressionAdapter,
     private readonly writer: OutputWriter
   ) {}
@@ -46,6 +46,25 @@ export class JobService {
   start(): void {
     this.active = true;
     this.schedule();
+  }
+
+  pause(id: string): JobView {
+    const result = this.db.prepare("UPDATE job_items SET status='paused' WHERE job_id=? AND status='queued'").run(id);
+    if (result.changes === 0 && !this.db.prepare("SELECT 1 FROM job_items WHERE job_id=? AND status='running'").get(id)) {
+      throw new AppError("JOB_NOT_PAUSABLE", "该任务当前不能暂停", 409);
+    }
+    this.refreshJob(id);
+    return this.get(id);
+  }
+
+  resume(id: string): JobView {
+    const result = this.db.prepare(
+      "UPDATE job_items SET status='queued', error_code=NULL, error_message=NULL WHERE job_id=? AND status IN ('paused','awaiting_resume')"
+    ).run(id);
+    if (result.changes === 0) throw new AppError("JOB_NOT_RESUMABLE", "该任务没有可继续的项目", 409);
+    this.refreshJob(id);
+    this.schedule(0);
+    return this.get(id);
   }
 
   stop(): void {
@@ -145,9 +164,23 @@ export class JobService {
     return this.get(jobId);
   }
 
-  list(): JobView[] {
-    const rows = this.db.prepare("SELECT id FROM compression_jobs ORDER BY created_at DESC LIMIT 10").all() as Array<{ id: string }>;
-    return rows.map((row) => this.get(row.id));
+  list(page = 1, pageSize = 20, status?: string, query?: string): { items: JobView[]; page: number; pageSize: number; total: number } {
+    const conditions: string[] = [];
+    const parameters: unknown[] = [];
+    if (status) {
+      conditions.push("cj.status=?");
+      parameters.push(status);
+    }
+    if (query) {
+      conditions.push("EXISTS(SELECT 1 FROM job_items ji JOIN image_entries i ON i.id=ji.image_id WHERE ji.job_id=cj.id AND i.relative_path LIKE ? ESCAPE '\\')");
+      parameters.push(`%${query.replace(/[\\%_]/g, "\\$&")}%`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const total = (this.db.prepare(`SELECT COUNT(*) count FROM compression_jobs cj ${where}`).get(...parameters) as { count: number }).count;
+    const rows = this.db.prepare(
+      `SELECT cj.id FROM compression_jobs cj ${where} ORDER BY cj.created_at DESC LIMIT ? OFFSET ?`
+    ).all(...parameters, pageSize, (page - 1) * pageSize) as Array<{ id: string }>;
+    return { items: rows.map((row) => this.get(row.id)), page, pageSize, total };
   }
 
   get(id: string): JobView {
@@ -181,6 +214,7 @@ export class JobService {
         savedBytes: item.saved_bytes,
         errorCode: item.error_code,
         errorMessage: item.error_message,
+        attemptCount: item.attempt_count,
         startedAt: item.started_at,
         finishedAt: item.finished_at
       }))
@@ -191,7 +225,7 @@ export class JobService {
     const now = new Date().toISOString();
     this.db.prepare(
       `UPDATE job_items SET status='cancelled', error_code='USER_CANCELLED',
-       error_message='用户取消排队任务', finished_at=? WHERE job_id=? AND status='queued'`
+       error_message='用户取消排队任务', finished_at=? WHERE job_id=? AND status IN ('queued','paused','awaiting_resume')`
     ).run(now, id);
     this.refreshJob(id);
     this.onChange(id);
@@ -286,7 +320,8 @@ export class JobService {
         throw new AppError("SOURCE_CHANGED_DURING_UPLOAD", "上传期间原图发生变化，结果未保存");
       }
       const allowOverwrite = Boolean(row.outputValid);
-      const written = await this.writer.write(row.workspace.output_real_path, row.relative_path, result, allowOverwrite);
+      const strategy = (row.workspace.conflict_strategy ?? "overwrite") as "overwrite" | "skip" | "suffix";
+      const written = await this.writer.write(row.workspace.output_real_path, row.relative_path, result, allowOverwrite, strategy);
       const now = new Date().toISOString();
       const finish = this.db.transaction(() => {
         this.db.prepare(
@@ -313,9 +348,10 @@ export class JobService {
       const now = new Date().toISOString();
       const code = signal.aborted ? "APP_SHUTDOWN" : error instanceof AppError ? error.code : "UNKNOWN";
       const message = signal.aborted ? "应用退出，压缩任务已中断" : errorMessage(error).slice(0, 400);
+      const status = code === "OUTPUT_SKIPPED" ? "skipped" : "failed";
       this.db.prepare(
-        `UPDATE job_items SET status='failed', error_code=?, error_message=?, finished_at=? WHERE id=?`
-      ).run(code, message, now, item.id);
+        `UPDATE job_items SET status=?, error_code=?, error_message=?, finished_at=? WHERE id=?`
+      ).run(status, code, message, now, item.id);
     } finally {
       this.refreshJob(item.job_id);
     }
@@ -330,12 +366,15 @@ export class JobService {
        SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) skipped,
        SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) queued,
        SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) running,
+       SUM(CASE WHEN status='paused' THEN 1 ELSE 0 END) paused,
+       SUM(CASE WHEN status='awaiting_resume' THEN 1 ELSE 0 END) awaiting_resume,
        COALESCE(SUM(input_size),0) input_bytes, COALESCE(SUM(output_size),0) output_bytes
        FROM job_items WHERE job_id=?`
     ).get(jobId) as any;
     const active = Number(stats.queued) + Number(stats.running);
-    const finalStatus = active > 0 ? "running" : Number(stats.failed) + Number(stats.skipped) > 0 ? "completed_with_errors" : Number(stats.cancelled) === Number(stats.total) ? "cancelled" : "completed";
-    const finishedAt = active === 0 ? new Date().toISOString() : null;
+    const suspended = Number(stats.paused) + Number(stats.awaiting_resume);
+    const finalStatus = Number(stats.awaiting_resume) > 0 ? "awaiting_resume" : Number(stats.paused) > 0 ? "paused" : active > 0 ? "running" : Number(stats.failed) + Number(stats.skipped) > 0 ? "completed_with_errors" : Number(stats.cancelled) === Number(stats.total) ? "cancelled" : "completed";
+    const finishedAt = active + suspended === 0 ? new Date().toISOString() : null;
     this.db.prepare(
       `UPDATE compression_jobs SET status=?, total=?, succeeded=?, failed=?, cancelled=?, skipped=?,
        input_bytes=?, output_bytes=?, finished_at=? WHERE id=?`

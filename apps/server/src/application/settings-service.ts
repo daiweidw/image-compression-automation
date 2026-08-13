@@ -2,16 +2,19 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { ulid } from "ulid";
-import type { SettingsResponse, UpdateSettingsRequest } from "@ica/contracts";
+import type { OutputConflictStrategy, SettingsResponse, UpdateSettingsRequest } from "@ica/contracts";
 import { AppError } from "../errors.js";
 import { PathPolicy } from "../infrastructure/path-policy.js";
-import { FileSecretStore } from "../infrastructure/secret-store.js";
+import type { SecretStore } from "../infrastructure/secret-store.js";
 
 interface StoredSettings {
   sourceDir: string;
   outputDir: string;
   recursive: boolean;
   compressionConcurrency: number;
+  watchEnabled: boolean;
+  autoCompress: boolean;
+  conflictStrategy: OutputConflictStrategy;
 }
 
 export interface KeyValidator {
@@ -25,7 +28,7 @@ export class SettingsService {
   constructor(
     private readonly appDataDir: string,
     private readonly db: Database.Database,
-    private readonly secrets: FileSecretStore,
+    private readonly secrets: SecretStore,
     private readonly pathPolicy: PathPolicy,
     private readonly keyValidator: KeyValidator
   ) {
@@ -53,6 +56,9 @@ export class SettingsService {
       outputDir: settings?.outputDir ?? "",
       recursive: settings?.recursive ?? true,
       compressionConcurrency: settings?.compressionConcurrency ?? 2,
+      watchEnabled: settings?.watchEnabled ?? true,
+      autoCompress: settings?.autoCompress ?? false,
+      conflictStrategy: settings?.conflictStrategy ?? "overwrite",
       apiKey: {
         configured: await this.secrets.hasTinyPngKey(),
         lastValidationStatus: usage.last_validation_status,
@@ -106,7 +112,10 @@ export class SettingsService {
       sourceDir: roots.sourceDir,
       outputDir: roots.outputDir,
       recursive: input.recursive,
-      compressionConcurrency: input.compressionConcurrency
+      compressionConcurrency: input.compressionConcurrency,
+      watchEnabled: input.watchEnabled,
+      autoCompress: input.autoCompress,
+      conflictStrategy: input.conflictStrategy
     };
     const previousKey = input.apiKeyAction === "replace" ? await this.secrets.getTinyPngKey() : null;
     await fs.mkdir(this.appDataDir, { recursive: true, mode: 0o700 });
@@ -138,15 +147,16 @@ export class SettingsService {
     if (existing && sameRoots) {
       this.db.prepare(
         `UPDATE workspaces SET source_dir=?, source_real_path=?, output_dir=?, output_real_path=?,
-         recursive=?, compression_concurrency=?, updated_at=? WHERE id=?`
-      ).run(next.sourceDir, roots.sourceRealPath, next.outputDir, roots.outputRealPath, Number(next.recursive), next.compressionConcurrency, now, existing.id);
+         recursive=?, compression_concurrency=?, watch_enabled=?, auto_compress=?, conflict_strategy=?, updated_at=? WHERE id=?`
+      ).run(next.sourceDir, roots.sourceRealPath, next.outputDir, roots.outputRealPath, Number(next.recursive), next.compressionConcurrency, Number(next.watchEnabled), Number(next.autoCompress), next.conflictStrategy, now, existing.id);
     } else {
       const changeWorkspace = this.db.transaction(() => {
         this.db.prepare("UPDATE workspaces SET active=0, updated_at=? WHERE active=1").run(now);
         this.db.prepare(
           `INSERT INTO workspaces (id, source_dir, source_real_path, output_dir, output_real_path,
-           recursive, compression_concurrency, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
-        ).run(ulid(), next.sourceDir, roots.sourceRealPath, next.outputDir, roots.outputRealPath, Number(next.recursive), next.compressionConcurrency, now, now);
+           recursive, compression_concurrency, watch_enabled, auto_compress, conflict_strategy, active, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+        ).run(ulid(), next.sourceDir, roots.sourceRealPath, next.outputDir, roots.outputRealPath, Number(next.recursive), next.compressionConcurrency, Number(next.watchEnabled), Number(next.autoCompress), next.conflictStrategy, now, now);
       });
       changeWorkspace();
     }

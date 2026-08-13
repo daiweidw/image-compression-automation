@@ -3,14 +3,14 @@
 ## 1. 文档信息
 
 - 项目名称：本地图片压缩管理工具
-- 文档版本：v1.0
-- 文档日期：2026-08-12
+- 文档版本：v2.0
+- 文档日期：2026-08-13
 - 关联需求：[需求文档](./requirements.md)
-- 目标版本：MVP / P0
+- 目标版本：第二版 / P1
 - 首要运行平台：macOS
-- 运行形态：浏览器界面 + 本机 Node.js 服务
+- 运行形态：Electron 桌面应用 + 内嵌本机服务
 
-本文档把产品需求转化为可以直接实施的技术方案。除标记为“可选”或 P1/P2 的内容外，均视为 P0 的实现约束。
+本文档把产品需求转化为可以直接实施的技术方案。P0 内容为继承的首版基础；原 P1 功能已纳入第二版交付。若旧章节仍以未来时态描述 P1，以本节和第 4.4 节的第二版架构为准。
 
 ## 2. 目标与约束
 
@@ -49,7 +49,7 @@
 - 路径越界、符号链接、输出冲突、CSRF、密钥和日志保护。
 - 单元、集成和端到端自动化测试。
 
-### 3.2 P1：MVP 稳定后增强
+### 3.2 P1：第二版已实现
 
 - 自动监听原图目录并增量刷新。
 - 原图与压缩结果并排或滑块质量对比。
@@ -70,6 +70,16 @@
 - 局域网访问、多用户和权限系统。
 
 P1/P2 不应提前改变 P0 的数据安全规则和模块边界。
+
+### 3.4 第二版分发约束
+
+- Electron 构建只输出 darwin-arm64 ZIP；不构建 Intel 或 universal 包。
+- arm64 打包脚本按已安装 Electron 的精确版本直接读取 `~/Library/Caches/electron/` 中的 ZIP，使用 `electronDist` 进入离线构建；不请求镜像或在线校验文件，缓存缺失时立即失败。
+- `electron-builder` 设置 `identity: "-"` 和 `hardenedRuntime: false`，对最终应用及嵌套组件执行 Ad Hoc 签名，但不执行 Developer ID 签名和公证。
+- 应用、Web 静态资源、Fastify 运行时、SQLite 和 Sharp 原生模块一并打包，目标机器不依赖开发环境。
+- 发布者不内置 API Key。密钥和数据库只写入当前使用者的 macOS 用户数据目录。
+- 首次启动采用 Finder 右键“打开”或“系统设置 → 隐私与安全性 → 仍要打开”的系统批准流程；目标 Mac 的安全策略可能禁止未公证应用，不提供 `xattr`、关闭 Gatekeeper 等绕过方法。
+- 不配置 App Store、DMG、安装器、更新服务器或 `autoUpdater`。
 
 ## 4. 总体架构
 
@@ -136,6 +146,43 @@ sequenceDiagram
 ```
 
 SSE 只负责通知“有状态变化”，SQLite 与 REST 返回值才是权威状态。SSE 断线后，页面重新查询当前扫描和任务即可恢复。
+
+### 4.4 第二版桌面运行架构
+
+```mermaid
+flowchart TB
+    Finder["Finder 双击 / 右键打开"] --> Electron["Electron 主进程"]
+    Electron --> Lock["单实例锁"]
+    Electron --> Runtime["Fastify 内嵌运行时\n127.0.0.1 随机端口"]
+    Electron --> Window["安全 BrowserWindow"]
+    Window -->|"同源 REST + SSE"| Runtime
+    Electron --> Picker["macOS 目录选择器 / Finder"]
+    Electron --> SafeStorage["Electron safeStorage"]
+    SafeStorage --> Keychain["macOS Keychain 保护的加密能力"]
+    Runtime --> Watcher["Chokidar 目录监听"]
+    Runtime --> Cache["SHA-256 缩略图磁盘缓存"]
+    Runtime --> DB2[("SQLite schema v2")]
+    Runtime --> Tiny2["TinyPNG HTTPS API"]
+```
+
+主进程先取得单实例锁，再启动内嵌服务，最后把窗口导航到随机本机地址。渲染进程设置 `nodeIntegration: false`、`contextIsolation: true`、`sandbox: true`，不直接访问 Node.js 或任意本地文件。目录选择、Finder 操作和安全存储通过后端的平台能力接口完成。
+
+退出流程由同一个幂等 `shutdown()` 协调：停止新任务、停止监听、等待扫描和任务执行器关闭、关闭 Fastify、执行 SQLite WAL checkpoint、关闭数据库，最后退出 Electron。页面退出按钮与窗口关闭均进入此流程。
+
+### 4.5 监听与任务恢复
+
+目录监听只订阅当前有效原图根目录，并对事件进行防抖和路径边界校验。普通监听事件触发增量扫描；只有 `autoCompress=true` 时，新增文件才自动创建任务，修改既有文件不会未经确认消耗 API 次数。
+
+重启恢复规则：
+
+- `running` 项标记失败并记录 `APP_RESTARTED`，不自动重传。
+- `queued` 与 `paused` 项转为 `awaiting_resume`。
+- 用户点击继续后才把等待项重新放回队列。
+- 已成功记录继续通过源哈希和结果存在性派生为“已压缩”。
+
+### 4.6 原生模块与 arm64 构建
+
+Electron 主进程与服务代码由 tsup 生成 ESM；`better-sqlite3` 和 `sharp` 保持为外部原生依赖，由 electron-builder 针对 arm64 重建。产物必须检查 Electron 可执行文件及所有 `.node` 文件均为 arm64。
 
 ## 5. 技术栈决策
 
@@ -1242,10 +1289,14 @@ CI 不访问用户目录、不使用真实 Key、不访问 TinyPNG。
 | ADR-004 | 状态按事实派生而非只存字符串 | 已接受 | 防止原图或结果变化后状态过期 |
 | ADR-005 | 业务层依赖自有 TinyPngAdapter | 已接受 | 隔离全局 Key、协议和测试 |
 | ADR-006 | 临时文件 + 原子替换 | 已接受 | 防止半成品结果 |
-| ADR-007 | P0 密钥使用 `0600` 本地文件 | 已接受 | 可实施且不污染配置/数据库；P1 换 Keychain |
+| ADR-007 | 桌面版使用 Electron `safeStorage`，浏览器兼容模式保留 `0600` 文件 | 已接受 | `safeStorage` 的加密能力由 macOS Keychain 保护；启动时迁移旧明文文件 |
 | ADR-008 | SSE 通知 + REST 权威查询 | 已接受 | 实时体验与断线恢复兼顾 |
 | ADR-009 | 重启不自动续跑排队任务 | 已接受 | 防止未经确认继续消耗 API 额度 |
 | ADR-010 | P0 保持输入格式和相对路径 | 已接受 | 输出可预测，避免额外计费和命名复杂度 |
+| ADR-011 | Electron 内嵌现有 Fastify 运行时 | 已接受 | 复用经过验证的业务层和 API，同时提供原生能力 |
+| ADR-012 | 只输出 arm64 Ad Hoc 签名 ZIP | 已接受 | 当前只交付 Apple Silicon；临时签名保证包内完整性，但不替代 Developer ID 与公证 |
+| ADR-013 | 自动监听默认开、自动压缩默认关 | 已接受 | 保持列表及时，同时避免未经确认消耗 API 次数 |
+| ADR-014 | 上传中断不自动重试，排队项等待人工恢复 | 已接受 | 防止无法确认服务端结果时产生重复计费 |
 
 任何后续实现若要推翻“已接受”决策，应新增 ADR，说明原因、替代方案、迁移影响和测试变化，不能在代码中静默改变。
 

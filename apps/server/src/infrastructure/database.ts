@@ -119,8 +119,29 @@ CREATE INDEX IF NOT EXISTS idx_images_workspace_present ON image_entries(workspa
 CREATE INDEX IF NOT EXISTS idx_job_items_status ON job_items(status, queued_at);
 CREATE INDEX IF NOT EXISTS idx_job_items_image ON job_items(image_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_image_job
-ON job_items(image_id) WHERE status IN ('queued', 'running');
+ON job_items(image_id) WHERE status IN ('queued', 'running', 'paused', 'awaiting_resume');
 `;
+
+function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((item) => item.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function migrate(db: Database.Database): void {
+  const transaction = db.transaction(() => {
+    ensureColumn(db, "workspaces", "watch_enabled", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "workspaces", "auto_compress", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "workspaces", "conflict_strategy", "TEXT NOT NULL DEFAULT 'overwrite'");
+    db.exec("DROP INDEX IF EXISTS idx_one_active_image_job");
+    db.exec(`CREATE UNIQUE INDEX idx_one_active_image_job
+      ON job_items(image_id) WHERE status IN ('queued', 'running', 'paused', 'awaiting_resume')`);
+    db.prepare(
+      `INSERT INTO app_meta (key, value) VALUES ('schema_version', '2')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value`
+    ).run();
+  });
+  transaction();
+}
 
 export async function openDatabase(appDataDir: string): Promise<Database.Database> {
   await fs.mkdir(appDataDir, { recursive: true, mode: 0o700 });
@@ -129,6 +150,7 @@ export async function openDatabase(appDataDir: string): Promise<Database.Databas
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
   db.exec(schema);
+  migrate(db);
   db.prepare(
     `INSERT INTO api_usage (id, compression_count, last_validation_status, updated_at)
      VALUES (1, NULL, 'unknown', ?)
@@ -145,12 +167,20 @@ export function recoverInterruptedJobs(db: Database.Database): void {
        error_message = '本地服务重启，任务已中断', finished_at = ? WHERE status = 'running'`
     ).run(now);
     db.prepare(
-      `UPDATE job_items SET status = 'cancelled', error_code = 'APP_RESTARTED',
-       error_message = '本地服务重启，排队任务已取消', finished_at = ? WHERE status = 'queued'`
-    ).run(now);
+      `UPDATE job_items SET status = 'awaiting_resume', error_code = 'APP_RESTARTED',
+       error_message = '应用已重新启动，请确认后继续任务', finished_at = NULL
+       WHERE status IN ('queued', 'paused')`
+    ).run();
     db.prepare(
-      `UPDATE compression_jobs SET status = 'completed_with_errors', finished_at = ?
-       WHERE status IN ('queued', 'running')`
+      `UPDATE compression_jobs SET status = CASE
+         WHEN EXISTS(SELECT 1 FROM job_items ji WHERE ji.job_id=compression_jobs.id AND ji.status='awaiting_resume')
+           THEN 'awaiting_resume'
+         ELSE 'completed_with_errors'
+       END,
+       finished_at = CASE
+         WHEN EXISTS(SELECT 1 FROM job_items ji WHERE ji.job_id=compression_jobs.id AND ji.status='awaiting_resume')
+           THEN NULL ELSE ? END
+       WHERE status IN ('queued', 'running', 'paused', 'awaiting_resume')`
     ).run(now);
   });
   transaction();

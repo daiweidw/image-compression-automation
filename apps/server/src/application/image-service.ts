@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import crypto from "node:crypto";
 import fileSystem from "node:fs";
+import path from "node:path";
 import type Database from "better-sqlite3";
 import type { ImageItem, ImageListResponse, ImageStatus } from "@ica/contracts";
 import { AppError } from "../errors.js";
@@ -82,6 +83,23 @@ export class ImageService {
       .filter((item) => ["pending", "source_changed", "output_missing", "failed", "compressed"].includes(item.status))
       .slice(0, 1000)
       .map((item) => item.id);
+  }
+
+  async idsForSourcePaths(absolutePaths: string[]): Promise<string[]> {
+    const workspace = this.workspace();
+    const ids: string[] = [];
+    for (const absolutePath of [...new Set(absolutePaths)]) {
+      const relative = path.relative(workspace.source_real_path, absolutePath);
+      if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) continue;
+      const key = process.platform === "darwin" || process.platform === "win32"
+        ? relative.normalize("NFC").toLocaleLowerCase("en-US")
+        : relative.normalize("NFC");
+      const row = this.db.prepare(
+        "SELECT id FROM image_entries WHERE workspace_id=? AND relative_path_key=? AND present=1 AND supported=1"
+      ).get(workspace.id, key) as { id: string } | undefined;
+      if (row) ids.push(row.id);
+    }
+    return ids;
   }
 
   private async filtered(options: ImageListOptions): Promise<{ items: ImageItem[]; summary: ImageListResponse["summary"] }> {

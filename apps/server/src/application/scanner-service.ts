@@ -79,6 +79,10 @@ export class ScannerService {
     if (this.current) await this.current;
   }
 
+  async waitForIdle(): Promise<ScanState> {
+    return this.current ? await this.current : this.getCurrent();
+  }
+
   getCurrent(): ScanState {
     const row = this.db.prepare("SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1").get() as any;
     if (!row) {
