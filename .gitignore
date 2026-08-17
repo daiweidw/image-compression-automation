@@ -13,5 +13,6 @@ release/
 logs/
 cache/
 secrets/
+.ica-test/
 .DS_Store
 *.log

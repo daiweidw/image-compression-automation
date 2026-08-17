@@ -7,7 +7,7 @@ import fastifyStatic from "@fastify/static";
 import sharp from "sharp";
 import { z } from "zod";
 import type Database from "better-sqlite3";
-import type { ApplicationStatus, DesktopCapabilities } from "@ica/contracts";
+import type { ApplicationStatus, DesktopCapabilities, LocalAppEvent } from "@ica/contracts";
 import { AppError } from "./errors.js";
 import { getWebDistDir } from "./paths.js";
 import { SettingsService } from "./application/settings-service.js";
@@ -15,10 +15,12 @@ import { ScannerService } from "./application/scanner-service.js";
 import { ImageService } from "./application/image-service.js";
 import { JobService } from "./application/job-service.js";
 import { ApplicationLifecycle } from "./application/application-lifecycle.js";
-import { WatchService } from "./application/watch-service.js";
+import { TinyPngUsageService } from "./application/tinypng-usage-service.js";
+import { ImportAutomationService } from "./application/import-automation-service.js";
 
 export interface PlatformIntegration {
   capabilities: DesktopCapabilities;
+  downloadsPath?: string;
   chooseDirectory?: (kind: "source" | "output", currentPath: string) => Promise<string | null>;
   revealPath?: (targetPath: string) => Promise<void>;
 }
@@ -29,16 +31,15 @@ export interface AppServices {
   scanner: ScannerService;
   images: ImageService;
   jobs: JobService;
-  watch?: WatchService;
+  usage: TinyPngUsageService;
+  importAutomation?: ImportAutomationService;
 }
 
 const updateSettingsSchema = z.object({
-  sourceDir: z.string().min(1),
+  outputMode: z.enum(["automatic", "custom"]),
   outputDir: z.string().min(1),
   recursive: z.boolean(),
   compressionConcurrency: z.number().int().min(1).max(5),
-  watchEnabled: z.boolean(),
-  autoCompress: z.boolean(),
   conflictStrategy: z.enum(["overwrite", "skip", "suffix"]),
   createOutputDir: z.boolean(),
   apiKeyAction: z.enum(["keep", "replace"]),
@@ -53,12 +54,19 @@ export async function buildApp(
 ) {
   const token = crypto.randomBytes(32).toString("base64url");
   const eventClients = new Set<NodeJS.WritableStream>();
-  const publish = (type: string, entityId?: string) => {
-    const payload = `data: ${JSON.stringify({ type, entityId: entityId ?? null, occurredAt: new Date().toISOString() })}\n\n`;
+  const publish = (type: string, entityId?: string, details: Partial<LocalAppEvent> = {}) => {
+    const payload = `data: ${JSON.stringify({ type, entityId: entityId ?? null, ...details, occurredAt: new Date().toISOString() })}\n\n`;
     for (const client of eventClients) client.write(payload);
   };
-  const defaultCapabilities: DesktopCapabilities = { desktop: false, nativeDirectoryPicker: false, revealInFinder: false, encryptedSecretStorage: false };
+  const defaultCapabilities: DesktopCapabilities = { desktop: false, nativeDirectoryPicker: false, fileDropPaths: false, revealInFinder: false, encryptedSecretStorage: false };
   services.jobs.setOnChange((jobId) => publish("job.changed", jobId));
+  services.usage.setOnChange(() => publish("tinypng.usage.changed"));
+  services.importAutomation?.setOnChange((event) => publish(event.type, event.imageId, {
+    scanId: event.scanId,
+    ...(event.imageStatus ? { imageStatus: event.imageStatus } : {}),
+    ...(event.errorCode ? { errorCode: event.errorCode } : {}),
+    ...(event.errorMessage ? { errorMessage: event.errorMessage } : {})
+  }));
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? "info",
@@ -134,13 +142,6 @@ export async function buildApp(
     await options.platform.revealPath(media.path);
     return ok(request, { revealed: true });
   });
-  app.post("/api/platform/reveal-directory", async (request) => {
-    if (!options.platform?.revealPath) throw new AppError("NATIVE_FEATURE_UNAVAILABLE", "当前运行模式不支持 Finder", 409);
-    const body = z.object({ kind: z.enum(["source", "output"]) }).parse(request.body);
-    const settings = await services.settings.getResponse();
-    await options.platform.revealPath(body.kind === "source" ? settings.sourceDir : settings.outputDir);
-    return ok(request, { revealed: true });
-  });
   app.get("/api/application/status", async (request) => {
     const status: ApplicationStatus = options.lifecycle?.getStatus() ?? {
       shuttingDown: false,
@@ -171,22 +172,29 @@ export async function buildApp(
     });
   });
   app.get("/api/settings", async (request) => ok(request, await services.settings.getResponse()));
+  app.get("/api/tinypng/usage", async (request) => ok(request, await services.usage.getUsage()));
+  app.post("/api/tinypng/usage/refresh", async (request) => {
+    const result = await services.usage.refresh();
+    return ok(request, result.usage);
+  });
   app.put("/api/settings", async (request) => {
     const body = updateSettingsSchema.parse(request.body);
     const result = await services.settings.update({
-      sourceDir: body.sourceDir,
+      outputMode: body.outputMode,
       outputDir: body.outputDir,
       recursive: body.recursive,
       compressionConcurrency: body.compressionConcurrency,
-      watchEnabled: body.watchEnabled,
-      autoCompress: body.autoCompress,
       conflictStrategy: body.conflictStrategy,
       createOutputDir: body.createOutputDir,
       apiKeyAction: body.apiKeyAction,
       ...(body.apiKey !== undefined ? { apiKey: body.apiKey } : {})
     });
-    services.scanner.start("incremental");
-    await services.watch?.sync();
+    publish("settings.changed");
+    return ok(request, result);
+  });
+  app.patch("/api/settings/auto-compress", async (request) => {
+    const body = z.object({ enabled: z.boolean() }).parse(request.body);
+    const result = await services.settings.setAutoCompressOnImport(body.enabled);
     publish("settings.changed");
     return ok(request, result);
   });
@@ -196,17 +204,32 @@ export async function buildApp(
   });
   app.delete("/api/settings/tinypng-key", async (request) => {
     await services.settings.deleteKey();
+    publish("settings.changed");
     return ok(request, { deleted: true });
   });
 
   app.post("/api/scans", async (request) => {
-    const body = z.object({ mode: z.enum(["incremental", "force_hash"]).default("incremental") }).parse(request.body ?? {});
-    const result = services.scanner.start(body.mode);
+    const body = z.object({
+      paths: z.array(z.string().min(1)).min(1).max(1000),
+      recursive: z.boolean().default(true),
+      sourceLabel: z.string().max(200).optional(),
+      mode: z.enum(["incremental", "force_hash"]).default("incremental")
+    }).parse(request.body ?? {});
+    const result = services.scanner.start({
+      paths: body.paths,
+      recursive: body.recursive,
+      ...(body.sourceLabel !== undefined ? { sourceLabel: body.sourceLabel } : {})
+    }, body.mode);
     publish("scan.changed", result.id ?? undefined);
     return ok(request, result);
   });
+  app.post("/api/scans/stop", async (request) => {
+    const result = await services.scanner.cancel();
+    publish("scan.changed", result.id ?? undefined);
+    publish("images.changed");
+    return ok(request, result);
+  });
   app.get("/api/scans/current", async (request) => ok(request, services.scanner.getCurrent()));
-  app.get("/api/watch", async (request) => ok(request, services.watch?.getState() ?? { enabled: false, watching: false, autoCompress: false, pendingChanges: 0, lastEventAt: null, lastError: null }));
 
   app.get("/api/images", async (request) => {
     const query = z.object({
@@ -244,6 +267,15 @@ export async function buildApp(
       ...(query.format !== undefined ? { formats: query.format.split(",").filter(Boolean) } : {})
     });
     return ok(request, { ids });
+  });
+  app.delete("/api/images", async (request) => {
+    const body = z.union([
+      z.object({ ids: z.array(z.string()).min(1).max(5000) }),
+      z.object({ all: z.literal(true) })
+    ]).parse(request.body);
+    const removed = "all" in body ? services.images.clear() : services.images.remove(body.ids);
+    publish("images.changed");
+    return ok(request, { removed });
   });
   app.get("/api/images/:id/thumbnail", async (request, reply) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
@@ -289,19 +321,19 @@ export async function buildApp(
     const { id } = z.object({ id: z.string() }).parse(request.params);
     return ok(request, services.jobs.get(id));
   });
+  app.post("/api/jobs/:id/reveal-output", async (request) => {
+    if (!options.platform?.revealPath) throw new AppError("NATIVE_FEATURE_UNAVAILABLE", "当前运行模式不支持 Finder", 409);
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const job = services.jobs.get(id);
+    if (!job.outputDir) throw new AppError("OUTPUT_NOT_FOUND", "该批次还没有输出目录", 404);
+    await options.platform.revealPath(job.outputDir);
+    return ok(request, { revealed: true });
+  });
   app.post("/api/jobs/:id/cancel", async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const result = services.jobs.cancel(id);
     publish("job.changed", id);
     return ok(request, result);
-  });
-  app.post("/api/jobs/:id/pause", async (request) => {
-    const { id } = z.object({ id: z.string() }).parse(request.params);
-    return ok(request, services.jobs.pause(id));
-  });
-  app.post("/api/jobs/:id/resume", async (request) => {
-    const { id } = z.object({ id: z.string() }).parse(request.params);
-    return ok(request, services.jobs.resume(id));
   });
   app.post("/api/job-items/:id/retry", async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
@@ -324,6 +356,6 @@ export async function buildApp(
 
 declare module "fastify" {
   interface FastifyInstance {
-    publish(type: string, entityId?: string): void;
+    publish(type: string, entityId?: string, details?: Partial<LocalAppEvent>): void;
   }
 }

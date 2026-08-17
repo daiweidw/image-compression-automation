@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import sharp from "sharp";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDatabase } from "../infrastructure/database.js";
 import { FileSecretStore } from "../infrastructure/secret-store.js";
 import { PathPolicy } from "../infrastructure/path-policy.js";
@@ -12,8 +12,15 @@ import type { TinyPngResult } from "../infrastructure/tinypng-adapter.js";
 import { ScannerService } from "./scanner-service.js";
 import { ImageService } from "./image-service.js";
 import { JobService } from "./job-service.js";
+import { TinyPngUsageService } from "./tinypng-usage-service.js";
+import { AppError } from "../errors.js";
+import { SessionOutputService } from "./session-output-service.js";
 
 const directories: string[] = [];
+
+function sessionOutputs(db: Awaited<ReturnType<typeof openDatabase>>, outputMode: "automatic" | "custom" = "automatic"): SessionOutputService {
+  return new SessionOutputService(db, { load: async () => ({ outputMode }) } as any);
+}
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
@@ -59,7 +66,7 @@ describe("JobService", () => {
       }
     };
     const imageService = new ImageService(db, new PathPolicy());
-    const jobs = new JobService(db, imageService, secrets, fakeTinyPng, new OutputWriter(new PathPolicy()));
+    const jobs = new JobService(db, imageService, secrets, fakeTinyPng, new OutputWriter(new PathPolicy()), sessionOutputs(db));
     jobs.start();
     const job = await jobs.create("request-1", [image.id], false);
     let result = jobs.get(job.id);
@@ -70,21 +77,22 @@ describe("JobService", () => {
     jobs.stop();
 
     expect(result).toMatchObject({ status: "completed", succeeded: 1, failed: 0 });
-    await expect(fs.readFile(path.join(output, "image.png"))).resolves.toEqual(compressed);
+    await expect(fs.readFile(path.join(result.outputDir, "image.png"))).resolves.toEqual(compressed);
+    expect(path.dirname(result.outputDir)).toBe(output);
+    expect(path.basename(result.outputDir)).toMatch(/^图片压缩_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d+)?$/);
     expect((await imageService.getById(image.id)).status).toBe("compressed");
     expect(db.prepare("SELECT compression_count FROM api_usage WHERE id=1").get()).toEqual({ compression_count: 3 });
     db.close();
   });
 
-  it("pauses queued items and resumes them without duplicating completed work", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ica-job-pause-test-"));
+  it("marks remaining images failed after the monthly quota is exhausted", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ica-job-quota-test-"));
     directories.push(root);
     const source = path.join(root, "source");
     const output = path.join(root, "output");
     const data = path.join(root, "data");
     await Promise.all([fs.mkdir(source), fs.mkdir(output)]);
-    await Promise.all(["one.png", "two.png"].map((name) => sharp({ create: { width: 30, height: 20, channels: 3, background: "#447766" } }).png().toFile(path.join(source, name))));
-    const compressed = await sharp({ create: { width: 30, height: 20, channels: 3, background: "#447766" } }).png().toBuffer();
+    await Promise.all(["one.png", "two.png"].map((name) => sharp({ create: { width: 20, height: 20, channels: 3, background: "#336655" } }).png().toFile(path.join(source, name))));
     const db = await openDatabase(data);
     const now = new Date().toISOString();
     db.prepare(`INSERT INTO workspaces (id,source_dir,source_real_path,output_dir,output_real_path,recursive,compression_concurrency,active,created_at,updated_at) VALUES ('w',?,?,?,?,1,1,1,?,?)`).run(source, source, output, output, now, now);
@@ -94,21 +102,105 @@ describe("JobService", () => {
     const imageIds = (db.prepare("SELECT id FROM image_entries ORDER BY filename").all() as Array<{ id: string }>).map((item) => item.id);
     const secrets = new FileSecretStore(data);
     await secrets.setTinyPngKey("test-key");
-    let releaseFirst!: () => void;
-    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
     let calls = 0;
-    const fakeTinyPng = { async compress(): Promise<TinyPngResult> { calls += 1; if (calls === 1) await firstGate; return { stream: Readable.from(compressed), mimeType: "image/png", contentLength: compressed.length, compressionCount: calls }; } };
-    const jobs = new JobService(db, new ImageService(db, new PathPolicy()), secrets, fakeTinyPng, new OutputWriter(new PathPolicy()));
+    let quotaRecovered = false;
+    const fakeTinyPng = {
+      async compress(): Promise<TinyPngResult> {
+        calls += 1;
+        throw new AppError("QUOTA_EXHAUSTED", "TinyPNG 本月免费额度已用尽", 429, { compressionCount: 500 });
+      },
+      async validateKey() {
+        return quotaRecovered
+          ? { valid: true, compressionCount: 3, quotaExceeded: false }
+          : { valid: true, compressionCount: 500, quotaExceeded: true };
+      }
+    };
+    const usage = new TinyPngUsageService(db, secrets, fakeTinyPng);
+    const jobs = new JobService(db, new ImageService(db, new PathPolicy()), secrets, fakeTinyPng, new OutputWriter(new PathPolicy()), sessionOutputs(db), usage);
     jobs.start();
-    const job = await jobs.create("pause-request", imageIds, false);
-    for (let count = 0; count < 100 && jobs.get(job.id).items.every((item) => item.status !== "running"); count += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(jobs.pause(job.id).status).toBe("paused");
-    releaseFirst();
-    for (let count = 0; count < 100 && jobs.get(job.id).items.some((item) => item.status === "running"); count += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(jobs.get(job.id)).toMatchObject({ status: "paused", succeeded: 1 });
-    jobs.resume(job.id);
+    const job = await jobs.create("quota-request", imageIds, false);
     for (let count = 0; count < 200 && ["queued", "running"].includes(jobs.get(job.id).status); count += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(jobs.get(job.id)).toMatchObject({ status: "completed", succeeded: 2 });
+
+    expect(jobs.get(job.id)).toMatchObject({ status: "completed_with_errors", failed: 2 });
+    expect(jobs.get(job.id).items.map((item) => item.status)).toEqual(["failed", "failed"]);
+    expect(calls).toBe(1);
+    expect(usage.isExhausted()).toBe(true);
+    await expect(jobs.create("blocked-request", [imageIds[1]!], false)).rejects.toMatchObject({ code: "QUOTA_EXHAUSTED" });
+    quotaRecovered = true;
+    await usage.refresh();
+    expect(jobs.get(job.id)).toMatchObject({ status: "completed_with_errors", failed: 2 });
+    jobs.stop();
+    db.close();
+  });
+
+  it("removes a newly-created batch directory when job persistence fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ica-job-directory-cleanup-test-"));
+    directories.push(root);
+    const source = path.join(root, "source");
+    const output = path.join(root, "output");
+    const data = path.join(root, "data");
+    await Promise.all([fs.mkdir(source), fs.mkdir(output)]);
+    await sharp({ create: { width: 12, height: 12, channels: 3, background: "#225544" } }).png().toFile(path.join(source, "image.png"));
+    const db = await openDatabase(data);
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO workspaces (id,source_dir,source_real_path,output_dir,output_real_path,recursive,compression_concurrency,active,created_at,updated_at) VALUES ('w',?,?,?,?,1,1,1,?,?)`).run(source, source, output, output, now, now);
+    const scanner = new ScannerService(db);
+    scanner.start();
+    await scanner.waitForIdle();
+    const image = db.prepare("SELECT id FROM image_entries LIMIT 1").get() as { id: string };
+    const secrets = new FileSecretStore(data);
+    await secrets.setTinyPngKey("test-key");
+    const jobs = new JobService(db, new ImageService(db, new PathPolicy()), secrets, {} as any, new OutputWriter(new PathPolicy()), sessionOutputs(db));
+    jobs.start();
+    const transaction = vi.spyOn(db, "transaction").mockImplementation((() => () => {
+      throw new Error("forced persistence failure");
+    }) as any);
+
+    await expect(jobs.create("failing-request", [image.id], false)).rejects.toThrow("forced persistence failure");
+    expect(await fs.readdir(output)).toEqual([]);
+    transaction.mockRestore();
+    jobs.stop();
+    db.close();
+  });
+
+  it("waits for an explicit item retry after a compression failure", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ica-job-manual-retry-test-"));
+    directories.push(root);
+    const source = path.join(root, "source");
+    const output = path.join(root, "output");
+    const data = path.join(root, "data");
+    await Promise.all([fs.mkdir(source), fs.mkdir(output)]);
+    await sharp({ create: { width: 20, height: 20, channels: 3, background: "#336655" } }).png().toFile(path.join(source, "retry.png"));
+    const compressed = await sharp({ create: { width: 20, height: 20, channels: 3, background: "#336655" } }).png().toBuffer();
+    const db = await openDatabase(data);
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO workspaces (id,source_dir,source_real_path,output_dir,output_real_path,recursive,compression_concurrency,active,created_at,updated_at) VALUES ('w',?,?,?,?,1,1,1,?,?)`).run(source, source, output, output, now, now);
+    const scanner = new ScannerService(db);
+    scanner.start();
+    await scanner.waitForIdle();
+    const image = db.prepare("SELECT id FROM image_entries LIMIT 1").get() as { id: string };
+    const secrets = new FileSecretStore(data);
+    await secrets.setTinyPngKey("test-key");
+    let calls = 0;
+    const fakeTinyPng = {
+      async compress(): Promise<TinyPngResult> {
+        calls += 1;
+        if (calls === 1) throw new AppError("CONNECTION", "网络连接失败", 503);
+        return { stream: Readable.from(compressed), mimeType: "image/png", contentLength: compressed.length, compressionCount: calls };
+      }
+    };
+    const jobs = new JobService(db, new ImageService(db, new PathPolicy()), secrets, fakeTinyPng, new OutputWriter(new PathPolicy()), sessionOutputs(db));
+    jobs.start();
+    const first = await jobs.create("manual-retry", [image.id], false);
+    for (let count = 0; count < 200 && ["queued", "running"].includes(jobs.get(first.id).status); count += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    const failed = jobs.get(first.id);
+    expect(failed).toMatchObject({ status: "completed_with_errors", failed: 1 });
+    expect(failed.items[0]).toMatchObject({ status: "failed", attemptCount: 1 });
+    expect(calls).toBe(1);
+
+    const retried = await jobs.retryItem(failed.items[0]!.id);
+    for (let count = 0; count < 200 && ["queued", "running"].includes(jobs.get(retried.id).status); count += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(jobs.get(retried.id)).toMatchObject({ status: "completed", succeeded: 1, outputDir: failed.outputDir });
     expect(calls).toBe(2);
     jobs.stop();
     db.close();

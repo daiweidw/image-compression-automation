@@ -23,4 +23,21 @@ describe("OutputWriter conflict strategy", () => {
     await expect(fs.readFile(path.join(root, "image.png"))).resolves.toEqual(original);
     await expect(fs.readFile(path.join(root, result.relativePath))).resolves.toEqual(output);
   });
+
+  it("serializes concurrent suffix selection within one output directory", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ica-output-concurrency-test-"));
+    directories.push(root);
+    const output = await sharp({ create: { width: 10, height: 10, channels: 3, background: "#225544" } }).png().toBuffer();
+    const writer = new OutputWriter(new PathPolicy());
+    const result = () => ({ stream: Readable.from(output), mimeType: "image/png", contentLength: output.length, compressionCount: null });
+
+    const written = await Promise.all([
+      writer.write(root, "image.png", result(), false, "suffix"),
+      writer.write(root, "image.png", result(), false, "suffix")
+    ]);
+
+    expect(written.map((item) => item.relativePath).sort()).toEqual(["image-compressed-1.png", "image.png"]);
+    await expect(fs.readFile(path.join(root, "image.png"))).resolves.toEqual(output);
+    await expect(fs.readFile(path.join(root, "image-compressed-1.png"))).resolves.toEqual(output);
+  });
 });

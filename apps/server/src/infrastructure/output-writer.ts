@@ -20,9 +20,15 @@ export interface WrittenOutput {
 }
 
 export class OutputWriter {
+  private readonly rootLocks = new Map<string, Promise<void>>();
+
   constructor(private readonly pathPolicy: PathPolicy) {}
 
   async write(root: string, relativePath: string, result: TinyPngResult, existingOutputValid: boolean, strategy: OutputConflictStrategy): Promise<WrittenOutput> {
+    return this.withRootLock(root, () => this.writeLocked(root, relativePath, result, existingOutputValid, strategy));
+  }
+
+  private async writeLocked(root: string, relativePath: string, result: TinyPngResult, existingOutputValid: boolean, strategy: OutputConflictStrategy): Promise<WrittenOutput> {
     let target = this.pathPolicy.resolveWithin(root, relativePath);
     const directory = path.dirname(target);
     await this.pathPolicy.assertNoSymlink(root, directory);
@@ -82,6 +88,24 @@ export class OutputWriter {
     } catch (error) {
       await fsp.rm(temporary, { force: true }).catch(() => undefined);
       throw error;
+    }
+  }
+
+  private async withRootLock<T>(root: string, operation: () => Promise<T>): Promise<T> {
+    const key = path.resolve(root);
+    const previous = this.rootLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queued = previous.then(() => gate);
+    this.rootLocks.set(key, queued);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.rootLocks.get(key) === queued) this.rootLocks.delete(key);
     }
   }
 }

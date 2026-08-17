@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS scan_runs (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   mode TEXT NOT NULL,
+  source_label TEXT,
   status TEXT NOT NULL,
   discovered_count INTEGER NOT NULL DEFAULT 0,
   processed_count INTEGER NOT NULL DEFAULT 0,
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS image_entries (
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   relative_path TEXT NOT NULL,
   relative_path_key TEXT NOT NULL,
+  source_absolute_path TEXT,
   filename TEXT NOT NULL,
   extension TEXT NOT NULL,
   mime_type TEXT,
@@ -63,6 +65,7 @@ CREATE TABLE IF NOT EXISTS compression_records (
   source_hash TEXT NOT NULL,
   source_size INTEGER NOT NULL,
   output_relative_path TEXT NOT NULL,
+  output_root_path TEXT,
   output_size INTEGER NOT NULL,
   output_hash TEXT NOT NULL,
   output_mtime_ns TEXT NOT NULL,
@@ -75,6 +78,7 @@ CREATE TABLE IF NOT EXISTS compression_jobs (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   client_request_id TEXT NOT NULL,
+  output_root_path TEXT,
   status TEXT NOT NULL,
   total INTEGER NOT NULL DEFAULT 0,
   succeeded INTEGER NOT NULL DEFAULT 0,
@@ -95,6 +99,7 @@ CREATE TABLE IF NOT EXISTS job_items (
   image_id TEXT NOT NULL REFERENCES image_entries(id) ON DELETE CASCADE,
   status TEXT NOT NULL,
   submitted_source_hash TEXT NOT NULL,
+  output_relative_path TEXT,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   input_size INTEGER,
   output_size INTEGER,
@@ -109,6 +114,12 @@ CREATE TABLE IF NOT EXISTS job_items (
 CREATE TABLE IF NOT EXISTS api_usage (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   compression_count INTEGER,
+  quota_limit INTEGER NOT NULL DEFAULT 500,
+  quota_state TEXT NOT NULL DEFAULT 'unknown',
+  usage_source TEXT,
+  usage_period TEXT,
+  exhausted_at TEXT,
+  last_error_code TEXT,
   last_validation_status TEXT NOT NULL DEFAULT 'unknown',
   last_validated_at TEXT,
   updated_at TEXT NOT NULL
@@ -119,7 +130,7 @@ CREATE INDEX IF NOT EXISTS idx_images_workspace_present ON image_entries(workspa
 CREATE INDEX IF NOT EXISTS idx_job_items_status ON job_items(status, queued_at);
 CREATE INDEX IF NOT EXISTS idx_job_items_image ON job_items(image_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_image_job
-ON job_items(image_id) WHERE status IN ('queued', 'running', 'paused', 'awaiting_resume');
+ON job_items(image_id) WHERE status IN ('queued', 'running');
 `;
 
 function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
@@ -129,14 +140,36 @@ function ensureColumn(db: Database.Database, table: string, column: string, defi
 
 function migrate(db: Database.Database): void {
   const transaction = db.transaction(() => {
-    ensureColumn(db, "workspaces", "watch_enabled", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "workspaces", "watch_enabled", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "workspaces", "auto_compress", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "workspaces", "conflict_strategy", "TEXT NOT NULL DEFAULT 'overwrite'");
+    ensureColumn(db, "scan_runs", "source_label", "TEXT");
+    ensureColumn(db, "image_entries", "source_absolute_path", "TEXT");
+    ensureColumn(db, "compression_records", "output_root_path", "TEXT");
+    ensureColumn(db, "compression_jobs", "output_root_path", "TEXT");
+    ensureColumn(db, "job_items", "output_relative_path", "TEXT");
+    ensureColumn(db, "api_usage", "quota_limit", "INTEGER NOT NULL DEFAULT 500");
+    ensureColumn(db, "api_usage", "quota_state", "TEXT NOT NULL DEFAULT 'unknown'");
+    ensureColumn(db, "api_usage", "usage_source", "TEXT");
+    ensureColumn(db, "api_usage", "usage_period", "TEXT");
+    ensureColumn(db, "api_usage", "exhausted_at", "TEXT");
+    ensureColumn(db, "api_usage", "last_error_code", "TEXT");
+    db.prepare("UPDATE workspaces SET watch_enabled=0, auto_compress=0").run();
+    db.prepare(
+      `UPDATE api_usage SET quota_state=CASE
+         WHEN compression_count >= quota_limit THEN 'exhausted'
+         WHEN compression_count * 1.0 / quota_limit >= 0.8 THEN 'warning'
+         ELSE 'available'
+       END,
+       usage_source=COALESCE(usage_source, 'cache'),
+       usage_period=COALESCE(usage_period, substr(updated_at, 1, 7))
+       WHERE compression_count IS NOT NULL AND quota_state='unknown'`
+    ).run();
     db.exec("DROP INDEX IF EXISTS idx_one_active_image_job");
     db.exec(`CREATE UNIQUE INDEX idx_one_active_image_job
-      ON job_items(image_id) WHERE status IN ('queued', 'running', 'paused', 'awaiting_resume')`);
+      ON job_items(image_id) WHERE status IN ('queued', 'running')`);
     db.prepare(
-      `INSERT INTO app_meta (key, value) VALUES ('schema_version', '2')
+      `INSERT INTO app_meta (key, value) VALUES ('schema_version', '5')
        ON CONFLICT(key) DO UPDATE SET value=excluded.value`
     ).run();
   });
@@ -145,43 +178,35 @@ function migrate(db: Database.Database): void {
 
 export async function openDatabase(appDataDir: string): Promise<Database.Database> {
   await fs.mkdir(appDataDir, { recursive: true, mode: 0o700 });
-  const db = new Database(path.join(appDataDir, "app.db"));
-  db.pragma("foreign_keys = ON");
-  db.pragma("journal_mode = WAL");
-  db.pragma("busy_timeout = 5000");
-  db.exec(schema);
-  migrate(db);
-  db.prepare(
-    `INSERT INTO api_usage (id, compression_count, last_validation_status, updated_at)
-     VALUES (1, NULL, 'unknown', ?)
-     ON CONFLICT(id) DO NOTHING`
-  ).run(new Date().toISOString());
-  return db;
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(path.join(appDataDir, "app.db"));
+    db.pragma("foreign_keys = ON");
+    db.pragma("journal_mode = WAL");
+    db.pragma("busy_timeout = 5000");
+    db.exec(schema);
+    migrate(db);
+    db.prepare(
+      `INSERT INTO api_usage (id, compression_count, quota_limit, quota_state, last_validation_status, updated_at)
+       VALUES (1, NULL, 500, 'unknown', 'unknown', ?)
+       ON CONFLICT(id) DO NOTHING`
+    ).run(new Date().toISOString());
+    return db;
+  } catch (error) {
+    try {
+      db?.close();
+    } catch {
+      // Preserve the initialization error that explains why startup failed.
+    }
+    throw error;
+  }
 }
 
-export function recoverInterruptedJobs(db: Database.Database): void {
-  const now = new Date().toISOString();
+export function initializeSessionState(db: Database.Database): void {
   const transaction = db.transaction(() => {
-    db.prepare(
-      `UPDATE job_items SET status = 'failed', error_code = 'APP_RESTARTED',
-       error_message = '本地服务重启，任务已中断', finished_at = ? WHERE status = 'running'`
-    ).run(now);
-    db.prepare(
-      `UPDATE job_items SET status = 'awaiting_resume', error_code = 'APP_RESTARTED',
-       error_message = '应用已重新启动，请确认后继续任务', finished_at = NULL
-       WHERE status IN ('queued', 'paused')`
-    ).run();
-    db.prepare(
-      `UPDATE compression_jobs SET status = CASE
-         WHEN EXISTS(SELECT 1 FROM job_items ji WHERE ji.job_id=compression_jobs.id AND ji.status='awaiting_resume')
-           THEN 'awaiting_resume'
-         ELSE 'completed_with_errors'
-       END,
-       finished_at = CASE
-         WHEN EXISTS(SELECT 1 FROM job_items ji WHERE ji.job_id=compression_jobs.id AND ji.status='awaiting_resume')
-           THEN NULL ELSE ? END
-       WHERE status IN ('queued', 'running', 'paused', 'awaiting_resume')`
-    ).run(now);
+    db.prepare("DELETE FROM compression_jobs").run();
+    db.prepare("DELETE FROM scan_runs").run();
+    db.prepare("UPDATE image_entries SET present=0, last_seen_scan_id=NULL").run();
   });
   transaction();
 }

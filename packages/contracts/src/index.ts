@@ -11,13 +11,27 @@ export type ImageStatus =
 export type JobStatus =
   | "queued"
   | "running"
-  | "paused"
-  | "awaiting_resume"
   | "completed"
   | "completed_with_errors"
   | "cancelled";
 
 export type OutputConflictStrategy = "overwrite" | "skip" | "suffix";
+
+export const TINYPNG_FREE_MONTHLY_LIMIT = 500;
+
+export type TinyPngQuotaStatus = "available" | "warning" | "exhausted" | "unknown";
+export type TinyPngUsageSource = "compression" | "validation" | "cache" | null;
+
+export interface TinyPngUsage {
+  configured: boolean;
+  used: number | null;
+  limit: number;
+  remaining: number | null;
+  status: TinyPngQuotaStatus;
+  updatedAt: string | null;
+  stale: boolean;
+  source: TinyPngUsageSource;
+}
 
 export interface ApiKeyState {
   configured: boolean;
@@ -28,33 +42,46 @@ export interface ApiKeyState {
 
 export interface SettingsResponse {
   configured: boolean;
-  sourceDir: string;
+  outputMode: "automatic" | "custom";
   outputDir: string;
+  sessionOutputDir: string | null;
+  autoCompressOnImport: boolean;
   recursive: boolean;
   compressionConcurrency: number;
-  watchEnabled: boolean;
-  autoCompress: boolean;
   conflictStrategy: OutputConflictStrategy;
   apiKey: ApiKeyState;
 }
 
 export interface UpdateSettingsRequest {
-  sourceDir: string;
+  outputMode: "automatic" | "custom";
   outputDir: string;
   recursive: boolean;
   compressionConcurrency: number;
-  watchEnabled: boolean;
-  autoCompress: boolean;
   conflictStrategy: OutputConflictStrategy;
   createOutputDir: boolean;
   apiKeyAction: "keep" | "replace";
   apiKey?: string | null;
 }
 
+export interface UpdateAutoCompressRequest {
+  enabled: boolean;
+}
+
+export interface LocalAppEvent {
+  type: string;
+  entityId: string | null;
+  scanId?: string;
+  imageStatus?: ImageStatus;
+  errorCode?: string;
+  errorMessage?: string;
+  occurredAt: string;
+}
+
 export interface ImageItem {
   id: string;
   filename: string;
   relativePath: string;
+  sourceDirectory: string;
   extension: string;
   mimeType: string | null;
   width: number | null;
@@ -68,6 +95,7 @@ export interface ImageItem {
   savedRatio: number | null;
   errorCode: string | null;
   errorMessage: string | null;
+  retryItemId: string | null;
 }
 
 export interface ImageListResponse {
@@ -84,7 +112,8 @@ export interface ImageListResponse {
 
 export interface ScanState {
   id: string | null;
-  status: "idle" | "running" | "succeeded" | "failed";
+  status: "idle" | "running" | "succeeded" | "stopped" | "failed";
+  sourceLabel: string | null;
   discoveredCount: number;
   processedCount: number;
   warningCount: number;
@@ -98,7 +127,7 @@ export interface JobItemView {
   imageId: string;
   filename: string;
   relativePath: string;
-  status: "queued" | "running" | "paused" | "awaiting_resume" | "succeeded" | "failed" | "cancelled" | "skipped";
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
   inputSize: number | null;
   outputSize: number | null;
   savedBytes: number | null;
@@ -112,6 +141,7 @@ export interface JobItemView {
 export interface JobView {
   id: string;
   status: JobStatus;
+  outputDir: string;
   total: number;
   succeeded: number;
   failed: number;
@@ -125,25 +155,17 @@ export interface JobView {
   items: JobItemView[];
 }
 
-export interface JobHistoryResponse {
+export interface JobListResponse {
   items: JobView[];
   page: number;
   pageSize: number;
   total: number;
 }
 
-export interface WatchState {
-  enabled: boolean;
-  watching: boolean;
-  autoCompress: boolean;
-  pendingChanges: number;
-  lastEventAt: string | null;
-  lastError: string | null;
-}
-
 export interface DesktopCapabilities {
   desktop: boolean;
   nativeDirectoryPicker: boolean;
+  fileDropPaths: boolean;
   revealInFinder: boolean;
   encryptedSecretStorage: boolean;
 }

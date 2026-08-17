@@ -86,9 +86,6 @@ importers:
       better-sqlite3:
         specifier: ^12.2.0
         version: 12.11.1
-      chokidar:
-        specifier: ^5.0.0
-        version: 5.0.0
       fastify:
         specifier: ^5.5.0
         version: 5.11.3
@@ -1409,10 +1406,6 @@ packages:
     resolution: {integrity: sha512-Qgzu8kfBvo+cA4962jnP1KkS6Dop5NS6g7R5LFYJr4b8Ub94PPQXUksCw9PvXoeXPRRddRNC5C1JQUR2SMGtnA==}
     engines: {node: '>= 14.16.0'}
 
-  chokidar@5.0.0:
-    resolution: {integrity: sha512-TQMmc3w+5AxjpL8iIiwebF73dRDF4fBIieAqGn9RGCWaEVwQ6Fb2cGe31Yns0RRIzii5goJ1Y7xbMwo1TxMplw==}
-    engines: {node: '>= 20.19.0'}
-
   chownr@1.1.4:
     resolution: {integrity: sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==}
 
@@ -2500,10 +2493,6 @@ packages:
   readdirp@4.1.2:
     resolution: {integrity: sha512-GDhwkLfywWL2s6vEjyhri+eXmfH6j1L7JE27WhqLeYzoh/A3DBaYGEj2H/HFZCn/kMfim73FXxEJTw06WtxQwg==}
     engines: {node: '>= 14.18.0'}
-
-  readdirp@5.1.1:
-    resolution: {integrity: sha512-Kko+Y5XQ6fM+Ce3dq3m9YGxnacYZYl9cA1wZjaF3Vbry2L3i1qVg8+CAgNPsXRArPMUMCaOR7oa9Nqntc43JKA==}
-    engines: {node: '>= 20.19.0'}
 
   real-require@0.2.0:
     resolution: {integrity: sha512-57frrGM/OCTLqLOAh0mhVA9VBMHd+9U7Zb2THMGdBUoZVOtGbJzjxsYGDJ3A9AYYCP4hn6y1TVbaOfzWtm5GFg==}
@@ -4272,10 +4261,6 @@ snapshots:
     dependencies:
       readdirp: 4.1.2
 
-  chokidar@5.0.0:
-    dependencies:
-      readdirp: 5.1.1
-
   chownr@1.1.4: {}
 
   chownr@3.0.0: {}
@@ -5438,8 +5423,6 @@ snapshots:
       util-deprecate: 1.0.2
 
   readdirp@4.1.2: {}
-
-  readdirp@5.1.1: {}
 
   real-require@0.2.0: {}
 

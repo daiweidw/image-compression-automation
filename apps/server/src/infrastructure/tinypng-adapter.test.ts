@@ -26,8 +26,30 @@ describe("TinyPngAdapter", () => {
       response.end(JSON.stringify({ message: "empty input" }));
     });
     const adapter = new TinyPngAdapter(base);
-    await expect(adapter.validateKey("good")).resolves.toEqual({ valid: true, compressionCount: 7 });
-    await expect(adapter.validateKey("bad")).resolves.toEqual({ valid: false, compressionCount: 7 });
+    await expect(adapter.validateKey("good")).resolves.toEqual({ valid: true, compressionCount: 7, quotaExceeded: false });
+    await expect(adapter.validateKey("bad")).resolves.toEqual({ valid: false, compressionCount: 7, quotaExceeded: false });
+  });
+
+  it("distinguishes monthly quota exhaustion from transient rate limiting", async () => {
+    const quotaBase = await fakeServer((_request, response) => {
+      response.statusCode = 429;
+      response.setHeader("Compression-Count", "500");
+      response.end(JSON.stringify({ error: "TooManyRequests", message: "Your monthly limit has been exceeded" }));
+    });
+    const quotaAdapter = new TinyPngAdapter(quotaBase);
+    await expect(quotaAdapter.compress(new URL(import.meta.url).pathname, "good")).rejects.toMatchObject({ code: "QUOTA_EXHAUSTED" });
+    await expect(quotaAdapter.validateKey("good")).resolves.toEqual({ valid: true, compressionCount: 500, quotaExceeded: true });
+
+    const rateBase = await fakeServer((_request, response) => {
+      response.statusCode = 429;
+      response.setHeader("Retry-After", "2");
+      response.end(JSON.stringify({ error: "TooManyRequests", message: "Too many requests" }));
+    });
+    const rateAdapter = new TinyPngAdapter(rateBase);
+    await expect(rateAdapter.compress(new URL(import.meta.url).pathname, "good")).rejects.toMatchObject({
+      code: "RATE_LIMITED",
+      details: { retryAfterSeconds: 2 }
+    });
   });
 
   it("uploads and returns the output stream", async () => {
@@ -56,5 +78,28 @@ describe("TinyPngAdapter", () => {
     for await (const chunk of result.stream as Readable) chunks.push(Buffer.from(chunk));
     expect(Buffer.concat(chunks)).toEqual(Buffer.from([1, 2, 3, 4]));
     expect(globalThis.fetch).toBe(originalFetch);
+  });
+
+  it("does not automatically retry a failed result download", async () => {
+    let base = "";
+    let downloadRequests = 0;
+    base = await fakeServer((request, response) => {
+      if (request.url === "/shrink") {
+        request.resume();
+        request.on("end", () => {
+          response.statusCode = 201;
+          response.setHeader("Location", `${base}/output/failed`);
+          response.end("{}");
+        });
+        return;
+      }
+      downloadRequests += 1;
+      response.statusCode = 503;
+      response.end(JSON.stringify({ message: "temporary failure" }));
+    });
+
+    const adapter = new TinyPngAdapter(base);
+    await expect(adapter.compress(new URL(import.meta.url).pathname, "good")).rejects.toMatchObject({ code: "SERVER_TEMPORARY" });
+    expect(downloadRequests).toBe(1);
   });
 });

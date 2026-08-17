@@ -29,9 +29,10 @@ export class ImageService {
 
   private async outputValid(workspace: any, row: any): Promise<boolean> {
     if (!row.output_relative_path) return false;
+    const outputRoot = row.output_root_path ?? workspace.output_real_path;
     try {
-      const output = this.pathPolicy.resolveWithin(workspace.output_real_path, row.output_relative_path);
-      await this.pathPolicy.assertNoSymlink(workspace.output_real_path, output);
+      const output = this.pathPolicy.resolveWithin(outputRoot, row.output_relative_path);
+      await this.pathPolicy.assertNoSymlink(outputRoot, output);
       const stat = await fs.lstat(output, { bigint: true });
       if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.size) !== row.output_size || stat.size <= 0n) return false;
       if (row.output_mtime_ns === stat.mtimeNs.toString()) return true;
@@ -46,7 +47,7 @@ export class ImageService {
   async getById(id: string): Promise<any> {
     const workspace = this.workspace();
     const row = this.db.prepare(
-      `SELECT i.*, r.source_hash AS record_source_hash, r.output_relative_path, r.output_size,
+      `SELECT i.*, r.source_hash AS record_source_hash, r.output_relative_path, r.output_root_path, r.output_size,
        r.output_hash, r.output_mtime_ns, r.compressed_at, r.output_mime_type,
        EXISTS(SELECT 1 FROM job_items ji WHERE ji.image_id=i.id AND ji.status='queued') AS queued,
        EXISTS(SELECT 1 FROM job_items ji WHERE ji.image_id=i.id AND ji.status='running') AS running,
@@ -89,11 +90,9 @@ export class ImageService {
     const workspace = this.workspace();
     const ids: string[] = [];
     for (const absolutePath of [...new Set(absolutePaths)]) {
-      const relative = path.relative(workspace.source_real_path, absolutePath);
-      if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) continue;
       const key = process.platform === "darwin" || process.platform === "win32"
-        ? relative.normalize("NFC").toLocaleLowerCase("en-US")
-        : relative.normalize("NFC");
+        ? path.resolve(absolutePath).normalize("NFC").toLocaleLowerCase("en-US")
+        : path.resolve(absolutePath).normalize("NFC");
       const row = this.db.prepare(
         "SELECT id FROM image_entries WHERE workspace_id=? AND relative_path_key=? AND present=1 AND supported=1"
       ).get(workspace.id, key) as { id: string } | undefined;
@@ -105,13 +104,14 @@ export class ImageService {
   private async filtered(options: ImageListOptions): Promise<{ items: ImageItem[]; summary: ImageListResponse["summary"] }> {
     const workspace = this.workspace();
     const rows = this.db.prepare(
-      `SELECT i.*, r.source_hash AS record_source_hash, r.output_relative_path, r.output_size,
+      `SELECT i.*, r.source_hash AS record_source_hash, r.output_relative_path, r.output_root_path, r.output_size,
        r.output_hash, r.output_mtime_ns, r.compressed_at,
        EXISTS(SELECT 1 FROM job_items ji WHERE ji.image_id=i.id AND ji.status='queued') AS queued,
        EXISTS(SELECT 1 FROM job_items ji WHERE ji.image_id=i.id AND ji.status='running') AS running,
        (SELECT status FROM job_items ji WHERE ji.image_id=i.id ORDER BY ji.queued_at DESC LIMIT 1) AS last_job_status,
        (SELECT error_code FROM job_items ji WHERE ji.image_id=i.id ORDER BY ji.queued_at DESC LIMIT 1) AS error_code,
        (SELECT error_message FROM job_items ji WHERE ji.image_id=i.id ORDER BY ji.queued_at DESC LIMIT 1) AS error_message
+       ,(SELECT id FROM job_items ji WHERE ji.image_id=i.id ORDER BY ji.queued_at DESC LIMIT 1) AS last_job_item_id
        FROM image_entries i LEFT JOIN compression_records r ON r.image_id=i.id
        WHERE i.workspace_id=? AND i.present=1`
     ).all(workspace.id) as any[];
@@ -133,6 +133,7 @@ export class ImageService {
         id: row.id,
         filename: row.filename,
         relativePath: row.relative_path,
+        sourceDirectory: row.source_absolute_path ? path.dirname(row.source_absolute_path) : workspace.source_real_path,
         extension: row.extension,
         mimeType: row.mime_type,
         width: row.width,
@@ -145,7 +146,8 @@ export class ImageService {
         savedBytes,
         savedRatio: savedBytes == null || row.source_size === 0 ? null : savedBytes / row.source_size,
         errorCode: row.scan_error_code ?? row.error_code,
-        errorMessage: row.scan_error_message ?? row.error_message
+        errorMessage: row.scan_error_message ?? row.error_message,
+        retryItemId: status === "failed" ? row.last_job_item_id ?? null : null
       });
     }
 
@@ -196,16 +198,41 @@ export class ImageService {
 
   async sourcePath(id: string): Promise<{ path: string; row: any }> {
     const row = await this.getById(id);
-    const source = this.pathPolicy.resolveWithin(row.workspace.source_real_path, row.relative_path);
-    await this.pathPolicy.assertNoSymlink(row.workspace.source_real_path, source);
+    const source = row.source_absolute_path
+      ? path.resolve(row.source_absolute_path)
+      : this.pathPolicy.resolveWithin(row.workspace.source_real_path, row.relative_path);
+    const stat = await fs.lstat(source);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new AppError("SOURCE_UNAVAILABLE", "原图不存在或不可读取", 404);
     return { path: source, row };
+  }
+
+  remove(ids: string[]): number {
+    const uniqueIds = [...new Set(ids)];
+    if (uniqueIds.length === 0 || uniqueIds.length > 5_000) throw new AppError("INVALID_IMAGE_SELECTION", "请选择要移除的图片");
+    const placeholders = uniqueIds.map(() => "?").join(",");
+    const active = this.db.prepare(
+      `SELECT COUNT(*) count FROM job_items WHERE image_id IN (${placeholders})
+       AND status IN ('queued','running')`
+    ).get(...uniqueIds) as { count: number };
+    if (active.count > 0) throw new AppError("IMAGE_JOB_ACTIVE", "正在处理或排队的图片不能移除", 409);
+    return this.db.prepare(`UPDATE image_entries SET present=0 WHERE id IN (${placeholders}) AND present=1`).run(...uniqueIds).changes;
+  }
+
+  clear(): number {
+    const active = this.db.prepare(
+      "SELECT COUNT(*) count FROM job_items WHERE status IN ('queued','running')"
+    ).get() as { count: number };
+    if (active.count > 0) throw new AppError("IMAGE_JOB_ACTIVE", "任务进行中，暂时不能清空待压缩列表", 409);
+    const workspace = this.workspace();
+    return this.db.prepare("UPDATE image_entries SET present=0 WHERE workspace_id=? AND present=1").run(workspace.id).changes;
   }
 
   async previewPath(id: string, variant: "source" | "output"): Promise<{ path: string; mimeType: string }> {
     const { path: source, row } = await this.sourcePath(id);
     if (variant === "source") return { path: source, mimeType: row.mime_type ?? "application/octet-stream" };
     if (!row.output_relative_path || !row.outputValid) throw new AppError("OUTPUT_NOT_FOUND", "压缩结果不存在", 404);
-    const output = this.pathPolicy.resolveWithin(row.workspace.output_real_path, row.output_relative_path);
+    const outputRoot = row.output_root_path ?? row.workspace.output_real_path;
+    const output = this.pathPolicy.resolveWithin(outputRoot, row.output_relative_path);
     return { path: output, mimeType: row.output_mime_type ?? row.mime_type };
   }
 }

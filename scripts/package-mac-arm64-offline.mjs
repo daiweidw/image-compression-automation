@@ -51,10 +51,11 @@ async function main() {
     "--mac",
     "zip",
     "--arm64",
+    "--config.npmRebuild=false",
     `--config.electronDist=${electronDist}`
   ], {
     cwd: root,
-    env: { ...process.env, ELECTRON_DOWNLOAD_CACHE_MODE: "1" },
+    env: { ...process.env, npm_config_offline: "true", ELECTRON_DOWNLOAD_CACHE_MODE: "1" },
     stdio: "inherit"
   });
 

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import path from "node:path";
 import type Database from "better-sqlite3";
 import { ulid } from "ulid";
 import type { JobView } from "@ica/contracts";
@@ -9,6 +10,8 @@ import type { SecretStore } from "../infrastructure/secret-store.js";
 import type { TinyPngResult } from "../infrastructure/tinypng-adapter.js";
 import { OutputWriter } from "../infrastructure/output-writer.js";
 import { ImageService } from "./image-service.js";
+import { TinyPngUsageService } from "./tinypng-usage-service.js";
+import type { SessionOutputService } from "./session-output-service.js";
 
 async function fileHash(filePath: string): Promise<string> {
   const hash = crypto.createHash("sha256");
@@ -16,7 +19,28 @@ async function fileHash(filePath: string): Promise<string> {
   return hash.digest("hex");
 }
 
-const retryableCodes = new Set(["RATE_LIMITED", "SERVER_TEMPORARY", "CONNECTION", "TIMEOUT"]);
+function uniqueOutputPaths(images: Array<{ relativePath: string; filename: string }>): string[] {
+  const used = new Set<string>();
+  return images.map((image) => {
+    const normalized = path.normalize(image.relativePath);
+    const safePath = path.isAbsolute(normalized) || normalized === ".." || normalized.startsWith(`..${path.sep}`)
+      ? image.filename
+      : normalized;
+    const directory = path.dirname(safePath);
+    const extension = path.extname(safePath);
+    const stem = path.basename(safePath, extension);
+    for (let index = 1; index <= 10_000; index += 1) {
+      const filename = index === 1 ? `${stem}${extension}` : `${stem}-${index}${extension}`;
+      const candidate = directory === "." ? filename : path.join(directory, filename);
+      const key = process.platform === "darwin" || process.platform === "win32" ? candidate.toLocaleLowerCase("en-US") : candidate;
+      if (!used.has(key)) {
+        used.add(key);
+        return candidate;
+      }
+    }
+    throw new AppError("OUTPUT_NAME_CONFLICT", `无法为 ${image.filename} 分配输出文件名`, 409);
+  });
+}
 
 export interface CompressionAdapter {
   compress(sourcePath: string, key: string, signal?: AbortSignal): Promise<TinyPngResult>;
@@ -30,13 +54,16 @@ export class JobService {
   private readonly controllers = new Map<string, AbortController>();
   private readonly tasks = new Set<Promise<void>>();
   private onChange: (jobId: string) => void = () => undefined;
+  private createLock: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly db: Database.Database,
     private readonly images: ImageService,
     private readonly secrets: SecretStore,
     private readonly tinypng: CompressionAdapter,
-    private readonly writer: OutputWriter
+    private readonly writer: OutputWriter,
+    private readonly outputs: SessionOutputService,
+    private readonly usage?: TinyPngUsageService
   ) {}
 
   setOnChange(listener: (jobId: string) => void): void {
@@ -46,25 +73,6 @@ export class JobService {
   start(): void {
     this.active = true;
     this.schedule();
-  }
-
-  pause(id: string): JobView {
-    const result = this.db.prepare("UPDATE job_items SET status='paused' WHERE job_id=? AND status='queued'").run(id);
-    if (result.changes === 0 && !this.db.prepare("SELECT 1 FROM job_items WHERE job_id=? AND status='running'").get(id)) {
-      throw new AppError("JOB_NOT_PAUSABLE", "该任务当前不能暂停", 409);
-    }
-    this.refreshJob(id);
-    return this.get(id);
-  }
-
-  resume(id: string): JobView {
-    const result = this.db.prepare(
-      "UPDATE job_items SET status='queued', error_code=NULL, error_message=NULL WHERE job_id=? AND status IN ('paused','awaiting_resume')"
-    ).run(id);
-    if (result.changes === 0) throw new AppError("JOB_NOT_RESUMABLE", "该任务没有可继续的项目", 409);
-    this.refreshJob(id);
-    this.schedule(0);
-    return this.get(id);
   }
 
   stop(): void {
@@ -106,12 +114,27 @@ export class JobService {
     await Promise.allSettled([...this.tasks]);
   }
 
-  async create(clientRequestId: string, imageIds: string[], confirmRecompress: boolean): Promise<JobView> {
+  async create(clientRequestId: string, imageIds: string[], confirmRecompress: boolean, outputRootOverride?: string): Promise<JobView> {
+    const previous = this.createLock;
+    let release!: () => void;
+    this.createLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await this.createLocked(clientRequestId, imageIds, confirmRecompress, outputRootOverride);
+    } finally {
+      release();
+    }
+  }
+
+  private async createLocked(clientRequestId: string, imageIds: string[], confirmRecompress: boolean, outputRootOverride?: string): Promise<JobView> {
     if (!this.active || this.shutdownPromise) throw new AppError("APP_SHUTTING_DOWN", "应用正在退出，不能创建新任务", 503);
     if (!clientRequestId || imageIds.length === 0 || imageIds.length > 1000) {
       throw new AppError("INVALID_JOB", "请选择 1 至 1000 张图片");
     }
     if (!(await this.secrets.hasTinyPngKey())) throw new AppError("API_KEY_REQUIRED", "请先在设置中配置 TinyPNG API Key", 409);
+    if (this.usage?.isExhausted()) throw new AppError("QUOTA_EXHAUSTED", "TinyPNG 本月免费额度已用尽", 409);
     const workspace = this.db.prepare("SELECT * FROM workspaces WHERE active=1 LIMIT 1").get() as any;
     if (!workspace) throw new AppError("SETTINGS_REQUIRED", "请先完成设置", 409);
 
@@ -121,7 +144,7 @@ export class JobService {
     if (existing) return this.get(existing.id);
 
     const uniqueIds = [...new Set(imageIds)];
-    const accepted: Array<{ id: string; hash: string; status: string }> = [];
+    const accepted: Array<{ id: string; hash: string; status: string; relativePath: string; filename: string }> = [];
     const needsConfirmation: string[] = [];
     for (const imageId of uniqueIds) {
       const image = await this.images.getById(imageId);
@@ -131,7 +154,7 @@ export class JobService {
         continue;
       }
       if (!image.source_hash) continue;
-      accepted.push({ id: imageId, hash: image.source_hash, status: image.status });
+      accepted.push({ id: imageId, hash: image.source_hash, status: image.status, relativePath: image.relative_path, filename: image.filename });
     }
     if (needsConfirmation.length) {
       throw new AppError("RECOMPRESS_CONFIRMATION_REQUIRED", "选择中包含已压缩图片，请确认后重新提交", 409, { imageIds: needsConfirmation });
@@ -140,20 +163,26 @@ export class JobService {
 
     const jobId = ulid();
     const now = new Date().toISOString();
+    const allocation = outputRootOverride === undefined
+      ? await this.outputs.resolve()
+      : { path: outputRootOverride, createdForSession: false };
+    const outputRoot = allocation.path;
+    const outputPaths = uniqueOutputPaths(accepted);
     const create = this.db.transaction(() => {
       this.db.prepare(
-        `INSERT INTO compression_jobs (id, workspace_id, client_request_id, status, total, created_at)
-         VALUES (?, ?, ?, 'queued', ?, ?)`
-      ).run(jobId, workspace.id, clientRequestId, accepted.length, now);
+        `INSERT INTO compression_jobs (id, workspace_id, client_request_id, output_root_path, status, total, created_at)
+         VALUES (?, ?, ?, ?, 'queued', ?, ?)`
+      ).run(jobId, workspace.id, clientRequestId, outputRoot, accepted.length, now);
       const insert = this.db.prepare(
-        `INSERT INTO job_items (id, job_id, image_id, status, submitted_source_hash, queued_at)
-         VALUES (?, ?, ?, 'queued', ?, ?)`
+        `INSERT INTO job_items (id, job_id, image_id, status, submitted_source_hash, output_relative_path, queued_at)
+         VALUES (?, ?, ?, 'queued', ?, ?, ?)`
       );
-      for (const image of accepted) insert.run(ulid(), jobId, image.id, image.hash, now);
+      for (const [index, image] of accepted.entries()) insert.run(ulid(), jobId, image.id, image.hash, outputPaths[index], now);
     });
     try {
       create();
     } catch (error) {
+      if (allocation.createdForSession) await this.outputs.releaseIfUnused(outputRoot);
       if ((error as Error).message.includes("idx_one_active_image_job")) {
         throw new AppError("IMAGE_ALREADY_QUEUED", "部分图片已经在压缩队列中", 409);
       }
@@ -193,6 +222,7 @@ export class JobService {
     return {
       id: job.id,
       status: job.status,
+      outputDir: job.output_root_path ?? "",
       total: job.total,
       succeeded: job.succeeded,
       failed: job.failed,
@@ -225,7 +255,7 @@ export class JobService {
     const now = new Date().toISOString();
     this.db.prepare(
       `UPDATE job_items SET status='cancelled', error_code='USER_CANCELLED',
-       error_message='用户取消排队任务', finished_at=? WHERE job_id=? AND status IN ('queued','paused','awaiting_resume')`
+       error_message='用户取消排队任务', finished_at=? WHERE job_id=? AND status='queued'`
     ).run(now, id);
     this.refreshJob(id);
     this.onChange(id);
@@ -233,9 +263,12 @@ export class JobService {
   }
 
   async retryItem(itemId: string): Promise<JobView> {
-    const item = this.db.prepare("SELECT image_id FROM job_items WHERE id=? AND status='failed'").get(itemId) as { image_id: string } | undefined;
+    const item = this.db.prepare(
+      `SELECT ji.image_id, cj.output_root_path FROM job_items ji
+       JOIN compression_jobs cj ON cj.id=ji.job_id WHERE ji.id=? AND ji.status='failed'`
+    ).get(itemId) as { image_id: string; output_root_path: string | null } | undefined;
     if (!item) throw new AppError("ITEM_NOT_RETRYABLE", "该任务项不能重试", 409);
-    return this.create(ulid(), [item.image_id], true);
+    return this.create(ulid(), [item.image_id], true, item.output_root_path ?? undefined);
   }
 
   private schedule(delay = 100): void {
@@ -248,8 +281,18 @@ export class JobService {
 
   private async pump(): Promise<void> {
     if (!this.active) return;
+    if (this.usage?.isExhausted()) {
+      this.failQueuedItems("QUOTA_EXHAUSTED", "TinyPNG 本月免费额度已用尽，请在额度恢复后手动重新压缩");
+      return;
+    }
     const workspace = this.db.prepare("SELECT compression_concurrency FROM workspaces WHERE active=1 LIMIT 1").get() as { compression_concurrency: number } | undefined;
-    const concurrency = workspace?.compression_concurrency ?? 2;
+    const configuredConcurrency = workspace?.compression_concurrency ?? 2;
+    const remaining = this.usage?.remaining() ?? null;
+    const concurrency = remaining == null ? configuredConcurrency : Math.min(configuredConcurrency, remaining);
+    if (concurrency === 0) {
+      this.failQueuedItems("QUOTA_EXHAUSTED", "TinyPNG 本月免费额度已用尽，请在额度恢复后手动重新压缩");
+      return;
+    }
     while (this.running < concurrency) {
       const item = this.claimNext();
       if (!item) break;
@@ -271,7 +314,7 @@ export class JobService {
 
   private claimNext(): any | null {
     const row = this.db.prepare(
-      `SELECT ji.*, cj.workspace_id FROM job_items ji JOIN compression_jobs cj ON cj.id=ji.job_id
+      `SELECT ji.*, cj.workspace_id, cj.output_root_path FROM job_items ji JOIN compression_jobs cj ON cj.id=ji.job_id
        WHERE ji.status='queued' ORDER BY ji.queued_at LIMIT 1`
     ).get() as any;
     if (!row) return null;
@@ -287,6 +330,7 @@ export class JobService {
   }
 
   private async execute(item: any, signal: AbortSignal): Promise<void> {
+    let affectedJobIds: string[] = [];
     try {
       signal.throwIfAborted();
       const { path: sourcePath, row } = await this.images.sourcePath(item.image_id);
@@ -297,64 +341,78 @@ export class JobService {
       const key = await this.secrets.getTinyPngKey();
       if (!key) throw new AppError("API_KEY_REQUIRED", "TinyPNG API Key 已删除");
 
-      let result;
-      let lastError: unknown;
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        this.db.prepare("UPDATE job_items SET attempt_count=? WHERE id=?").run(attempt, item.id);
-        try {
-          result = await this.tinypng.compress(sourcePath, key, signal);
-          break;
-        } catch (error) {
-          if (signal.aborted) throw error;
-          lastError = error;
-          const code = error instanceof AppError ? error.code : "UNKNOWN";
-          if (!retryableCodes.has(code) || attempt === 3) throw error;
-          await new Promise((resolve) => setTimeout(resolve, attempt === 1 ? 1000 : 3000));
-        }
-      }
-      if (!result) throw lastError;
+      this.db.prepare("UPDATE job_items SET attempt_count=1 WHERE id=?").run(item.id);
+      const result = await this.tinypng.compress(sourcePath, key, signal);
       signal.throwIfAborted();
 
       const afterStat = await fsp.stat(sourcePath, { bigint: true });
       if (beforeStat.size !== afterStat.size || beforeStat.mtimeNs !== afterStat.mtimeNs) {
         throw new AppError("SOURCE_CHANGED_DURING_UPLOAD", "上传期间原图发生变化，结果未保存");
       }
-      const allowOverwrite = Boolean(row.outputValid);
-      const strategy = (row.workspace.conflict_strategy ?? "overwrite") as "overwrite" | "skip" | "suffix";
-      const written = await this.writer.write(row.workspace.output_real_path, row.relative_path, result, allowOverwrite, strategy);
+      const outputRoot = item.output_root_path ?? row.workspace.output_real_path;
+      const outputRelativePath = item.output_relative_path ?? row.relative_path;
+      const written = await this.writer.write(outputRoot, outputRelativePath, result, false, "suffix");
       const now = new Date().toISOString();
       const finish = this.db.transaction(() => {
         this.db.prepare(
           `INSERT INTO compression_records (
-            image_id, source_hash, source_size, output_relative_path, output_size, output_hash,
+            image_id, source_hash, source_size, output_relative_path, output_root_path, output_size, output_hash,
             output_mtime_ns, output_mime_type, compression_count, compressed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(image_id) DO UPDATE SET source_hash=excluded.source_hash,
             source_size=excluded.source_size, output_relative_path=excluded.output_relative_path,
+            output_root_path=excluded.output_root_path,
             output_size=excluded.output_size, output_hash=excluded.output_hash,
             output_mtime_ns=excluded.output_mtime_ns, output_mime_type=excluded.output_mime_type,
             compression_count=excluded.compression_count, compressed_at=excluded.compressed_at`
-        ).run(item.image_id, beforeHash, Number(beforeStat.size), written.relativePath, written.size, written.hash, written.mtimeNs, written.mimeType, result.compressionCount, now);
+        ).run(item.image_id, beforeHash, Number(beforeStat.size), written.relativePath, outputRoot, written.size, written.hash, written.mtimeNs, written.mimeType, result.compressionCount, now);
         this.db.prepare(
           `UPDATE job_items SET status='succeeded', input_size=?, output_size=?, saved_bytes=?,
            finished_at=?, error_code=NULL, error_message=NULL WHERE id=?`
         ).run(Number(beforeStat.size), written.size, Math.max(0, Number(beforeStat.size) - written.size), now, item.id);
-        if (result.compressionCount != null) {
-          this.db.prepare("UPDATE api_usage SET compression_count=?, updated_at=? WHERE id=1").run(result.compressionCount, now);
-        }
       });
       finish();
+      if (result.compressionCount != null) {
+        if (this.usage) this.usage.recordCompression(result.compressionCount);
+        else this.db.prepare("UPDATE api_usage SET compression_count=?, updated_at=? WHERE id=1").run(result.compressionCount, now);
+      }
     } catch (error) {
       const now = new Date().toISOString();
       const code = signal.aborted ? "APP_SHUTDOWN" : error instanceof AppError ? error.code : "UNKNOWN";
       const message = signal.aborted ? "应用退出，压缩任务已中断" : errorMessage(error).slice(0, 400);
+      if (code === "QUOTA_EXHAUSTED") {
+        const count = error instanceof AppError && typeof (error.details as any)?.compressionCount === "number"
+          ? Number((error.details as any).compressionCount)
+          : null;
+        this.usage?.recordQuotaExhausted(count);
+        affectedJobIds = this.failQueuedItems(code, "TinyPNG 本月免费额度已用尽，请在额度恢复后手动重新压缩");
+      } else if (code === "ACCOUNT_INVALID") {
+        this.usage?.recordError(code);
+        affectedJobIds = this.failQueuedItems(code, "TinyPNG API Key 无效，请更新 Key 后手动重新压缩");
+      }
       const status = code === "OUTPUT_SKIPPED" ? "skipped" : "failed";
       this.db.prepare(
         `UPDATE job_items SET status=?, error_code=?, error_message=?, finished_at=? WHERE id=?`
       ).run(status, code, message, now, item.id);
     } finally {
       this.refreshJob(item.job_id);
+      for (const jobId of affectedJobIds) {
+        if (jobId !== item.job_id) this.refreshJob(jobId);
+      }
     }
+  }
+
+  private failQueuedItems(code: string, message: string): string[] {
+    const jobs = this.db.prepare(
+      "SELECT DISTINCT job_id FROM job_items WHERE status='queued'"
+    ).all() as Array<{ job_id: string }>;
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `UPDATE job_items SET status='failed', error_code=?, error_message=?, finished_at=? WHERE status='queued'`
+    ).run(code, message, now);
+    const jobIds = jobs.map(({ job_id: jobId }) => jobId);
+    for (const jobId of jobIds) this.refreshJob(jobId);
+    return jobIds;
   }
 
   private refreshJob(jobId: string): void {
@@ -366,15 +424,12 @@ export class JobService {
        SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) skipped,
        SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) queued,
        SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) running,
-       SUM(CASE WHEN status='paused' THEN 1 ELSE 0 END) paused,
-       SUM(CASE WHEN status='awaiting_resume' THEN 1 ELSE 0 END) awaiting_resume,
        COALESCE(SUM(input_size),0) input_bytes, COALESCE(SUM(output_size),0) output_bytes
        FROM job_items WHERE job_id=?`
     ).get(jobId) as any;
     const active = Number(stats.queued) + Number(stats.running);
-    const suspended = Number(stats.paused) + Number(stats.awaiting_resume);
-    const finalStatus = Number(stats.awaiting_resume) > 0 ? "awaiting_resume" : Number(stats.paused) > 0 ? "paused" : active > 0 ? "running" : Number(stats.failed) + Number(stats.skipped) > 0 ? "completed_with_errors" : Number(stats.cancelled) === Number(stats.total) ? "cancelled" : "completed";
-    const finishedAt = active + suspended === 0 ? new Date().toISOString() : null;
+    const finalStatus = active > 0 ? "running" : Number(stats.failed) + Number(stats.skipped) > 0 ? "completed_with_errors" : Number(stats.cancelled) === Number(stats.total) ? "cancelled" : "completed";
+    const finishedAt = active === 0 ? new Date().toISOString() : null;
     this.db.prepare(
       `UPDATE compression_jobs SET status=?, total=?, succeeded=?, failed=?, cancelled=?, skipped=?,
        input_bytes=?, output_bytes=?, finished_at=? WHERE id=?`
