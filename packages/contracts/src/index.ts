@@ -23,11 +23,15 @@ export type TinyPngQuotaStatus = "available" | "warning" | "exhausted" | "unknow
 export type TinyPngUsageSource = "compression" | "validation" | "cache" | null;
 
 export interface TinyPngUsage {
+  keyId: string | null;
+  keyName: string | null;
   configured: boolean;
   used: number | null;
   limit: number;
   remaining: number | null;
   status: TinyPngQuotaStatus;
+  canCompress: boolean;
+  lastValidationStatus: "valid" | "invalid" | "unknown";
   updatedAt: string | null;
   stale: boolean;
   source: TinyPngUsageSource;
@@ -35,9 +39,46 @@ export interface TinyPngUsage {
 
 export interface ApiKeyState {
   configured: boolean;
+  activeKeyId: string | null;
+  activeKeyName: string | null;
+  canCompress: boolean;
   lastValidationStatus: "valid" | "invalid" | "unknown";
   lastValidatedAt: string | null;
   compressionCount: number | null;
+}
+
+export interface TinyPngKeyView {
+  id: string;
+  name: string;
+  active: boolean;
+  used: number | null;
+  limit: number;
+  remaining: number | null;
+  status: TinyPngQuotaStatus;
+  canCompress: boolean;
+  stale: boolean;
+  source: TinyPngUsageSource;
+  lastValidationStatus: "valid" | "invalid" | "unknown";
+  lastValidatedAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface TinyPngKeyListResponse {
+  items: TinyPngKeyView[];
+  activeKeyId: string | null;
+}
+
+export interface CreateTinyPngKeyRequest {
+  name: string;
+  apiKey: string;
+}
+
+export interface RenameTinyPngKeyRequest {
+  name: string;
+}
+
+export interface ActivateTinyPngKeyRequest {
+  keyId: string;
 }
 
 export interface SettingsResponse {
@@ -59,8 +100,6 @@ export interface UpdateSettingsRequest {
   compressionConcurrency: number;
   conflictStrategy: OutputConflictStrategy;
   createOutputDir: boolean;
-  apiKeyAction: "keep" | "replace";
-  apiKey?: string | null;
 }
 
 export interface UpdateAutoCompressRequest {
@@ -142,6 +181,8 @@ export interface JobView {
   id: string;
   status: JobStatus;
   outputDir: string;
+  apiKeyId: string | null;
+  apiKeyName: string | null;
   total: number;
   succeeded: number;
   failed: number;

@@ -97,7 +97,14 @@ export async function useNativeAbi(info, abi) {
   const cachePath = nativeCachePath(info, abi);
   await fs.access(cachePath);
   await fs.mkdir(path.dirname(info.bindingPath), { recursive: true });
-  await fs.copyFile(cachePath, info.bindingPath);
+  const temporary = `${info.bindingPath}.${process.pid}.${abi}.tmp`;
+  try {
+    await fs.copyFile(cachePath, temporary);
+    await fs.rename(temporary, info.bindingPath);
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
   const actual = inspectAddonAbi(info.bindingPath);
   if (actual !== abi) throw new Error(`原生模块 ABI 切换失败：期望 ${abi}，实际 ${actual}`);
 }

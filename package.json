@@ -1,6 +1,6 @@
 {
   "name": "image-compression-automation",
-  "version": "0.2.6",
+  "version": "1.0.1",
   "description": "在 macOS 本地管理和批量压缩 TinyPNG 图片的桌面工作台",
   "author": "Image Compression Automation",
   "private": true,

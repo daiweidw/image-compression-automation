@@ -6,11 +6,11 @@ import type Database from "better-sqlite3";
 import { ulid } from "ulid";
 import type { JobView } from "@ica/contracts";
 import { AppError, errorMessage } from "../errors.js";
-import type { SecretStore } from "../infrastructure/secret-store.js";
 import type { TinyPngResult } from "../infrastructure/tinypng-adapter.js";
 import { OutputWriter } from "../infrastructure/output-writer.js";
 import { ImageService } from "./image-service.js";
 import { TinyPngUsageService } from "./tinypng-usage-service.js";
+import { TinyPngKeyService } from "./tinypng-key-service.js";
 import type { SessionOutputService } from "./session-output-service.js";
 
 async function fileHash(filePath: string): Promise<string> {
@@ -59,11 +59,11 @@ export class JobService {
   constructor(
     private readonly db: Database.Database,
     private readonly images: ImageService,
-    private readonly secrets: SecretStore,
+    private readonly keys: TinyPngKeyService,
     private readonly tinypng: CompressionAdapter,
     private readonly writer: OutputWriter,
     private readonly outputs: SessionOutputService,
-    private readonly usage?: TinyPngUsageService
+    private readonly usage: TinyPngUsageService
   ) {}
 
   setOnChange(listener: (jobId: string) => void): void {
@@ -133,8 +133,7 @@ export class JobService {
     if (!clientRequestId || imageIds.length === 0 || imageIds.length > 1000) {
       throw new AppError("INVALID_JOB", "请选择 1 至 1000 张图片");
     }
-    if (!(await this.secrets.hasTinyPngKey())) throw new AppError("API_KEY_REQUIRED", "请先在设置中配置 TinyPNG API Key", 409);
-    if (this.usage?.isExhausted()) throw new AppError("QUOTA_EXHAUSTED", "TinyPNG 本月免费额度已用尽", 409);
+    const activeKey = await this.keys.activeForCompression();
     const workspace = this.db.prepare("SELECT * FROM workspaces WHERE active=1 LIMIT 1").get() as any;
     if (!workspace) throw new AppError("SETTINGS_REQUIRED", "请先完成设置", 409);
 
@@ -170,9 +169,10 @@ export class JobService {
     const outputPaths = uniqueOutputPaths(accepted);
     const create = this.db.transaction(() => {
       this.db.prepare(
-        `INSERT INTO compression_jobs (id, workspace_id, client_request_id, output_root_path, status, total, created_at)
-         VALUES (?, ?, ?, ?, 'queued', ?, ?)`
-      ).run(jobId, workspace.id, clientRequestId, outputRoot, accepted.length, now);
+        `INSERT INTO compression_jobs (
+           id,workspace_id,client_request_id,output_root_path,tinypng_key_id,tinypng_key_name,status,total,created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`
+      ).run(jobId, workspace.id, clientRequestId, outputRoot, activeKey.id, activeKey.name, accepted.length, now);
       const insert = this.db.prepare(
         `INSERT INTO job_items (id, job_id, image_id, status, submitted_source_hash, output_relative_path, queued_at)
          VALUES (?, ?, ?, 'queued', ?, ?, ?)`
@@ -223,6 +223,8 @@ export class JobService {
       id: job.id,
       status: job.status,
       outputDir: job.output_root_path ?? "",
+      apiKeyId: job.tinypng_key_id ?? null,
+      apiKeyName: job.tinypng_key_name ?? null,
       total: job.total,
       succeeded: job.succeeded,
       failed: job.failed,
@@ -281,19 +283,10 @@ export class JobService {
 
   private async pump(): Promise<void> {
     if (!this.active) return;
-    if (this.usage?.isExhausted()) {
-      this.failQueuedItems("QUOTA_EXHAUSTED", "TinyPNG 本月免费额度已用尽，请在额度恢复后手动重新压缩");
-      return;
-    }
+    this.failBlockedQueuedItems();
     const workspace = this.db.prepare("SELECT compression_concurrency FROM workspaces WHERE active=1 LIMIT 1").get() as { compression_concurrency: number } | undefined;
     const configuredConcurrency = workspace?.compression_concurrency ?? 2;
-    const remaining = this.usage?.remaining() ?? null;
-    const concurrency = remaining == null ? configuredConcurrency : Math.min(configuredConcurrency, remaining);
-    if (concurrency === 0) {
-      this.failQueuedItems("QUOTA_EXHAUSTED", "TinyPNG 本月免费额度已用尽，请在额度恢复后手动重新压缩");
-      return;
-    }
-    while (this.running < concurrency) {
+    while (this.running < configuredConcurrency) {
       const item = this.claimNext();
       if (!item) break;
       this.running += 1;
@@ -314,8 +307,22 @@ export class JobService {
 
   private claimNext(): any | null {
     const row = this.db.prepare(
-      `SELECT ji.*, cj.workspace_id, cj.output_root_path FROM job_items ji JOIN compression_jobs cj ON cj.id=ji.job_id
-       WHERE ji.status='queued' ORDER BY ji.queued_at LIMIT 1`
+      `SELECT ji.*,cj.workspace_id,cj.output_root_path,cj.tinypng_key_id,cj.tinypng_key_name
+       FROM job_items ji
+       JOIN compression_jobs cj ON cj.id=ji.job_id
+       JOIN tinypng_api_usage u ON u.key_id=cj.tinypng_key_id
+       WHERE ji.status='queued'
+         AND u.last_validation_status='valid'
+         AND u.quota_state<>'exhausted'
+         AND (
+           u.compression_count IS NULL OR
+           (u.quota_limit-u.compression_count) > (
+             SELECT COUNT(*) FROM job_items running_item
+             JOIN compression_jobs running_job ON running_job.id=running_item.job_id
+             WHERE running_item.status='running' AND running_job.tinypng_key_id=cj.tinypng_key_id
+           )
+         )
+       ORDER BY ji.queued_at LIMIT 1`
     ).get() as any;
     if (!row) return null;
     const now = new Date().toISOString();
@@ -338,8 +345,10 @@ export class JobService {
       const beforeHash = await fileHash(sourcePath);
       signal.throwIfAborted();
       if (beforeHash !== item.submitted_source_hash) throw new AppError("SOURCE_CHANGED", "原图已变化，请重新扫描后再压缩");
-      const key = await this.secrets.getTinyPngKey();
-      if (!key) throw new AppError("API_KEY_REQUIRED", "TinyPNG API Key 已删除");
+      const keyId = item.tinypng_key_id as string | null;
+      if (!keyId) throw new AppError("API_KEY_SECRET_MISSING", "任务绑定的 TinyPNG API Key 不存在");
+      const key = await this.keys.getSecret(keyId);
+      if (!key) throw new AppError("API_KEY_SECRET_MISSING", "任务绑定的 TinyPNG API Key 密钥文件缺失");
 
       this.db.prepare("UPDATE job_items SET attempt_count=1 WHERE id=?").run(item.id);
       const result = await this.tinypng.compress(sourcePath, key, signal);
@@ -373,8 +382,7 @@ export class JobService {
       });
       finish();
       if (result.compressionCount != null) {
-        if (this.usage) this.usage.recordCompression(result.compressionCount);
-        else this.db.prepare("UPDATE api_usage SET compression_count=?, updated_at=? WHERE id=1").run(result.compressionCount, now);
+        this.usage.recordCompression(keyId, result.compressionCount);
       }
     } catch (error) {
       const now = new Date().toISOString();
@@ -384,11 +392,18 @@ export class JobService {
         const count = error instanceof AppError && typeof (error.details as any)?.compressionCount === "number"
           ? Number((error.details as any).compressionCount)
           : null;
-        this.usage?.recordQuotaExhausted(count);
-        affectedJobIds = this.failQueuedItems(code, "TinyPNG 本月免费额度已用尽，请在额度恢复后手动重新压缩");
+        if (item.tinypng_key_id) {
+          this.usage.recordQuotaExhausted(item.tinypng_key_id, count);
+          affectedJobIds = this.failQueuedItemsForKey(item.tinypng_key_id, code, "该 API Key 本月免费额度已用尽，请切换 Key 后手动重新压缩");
+        }
       } else if (code === "ACCOUNT_INVALID") {
-        this.usage?.recordError(code);
-        affectedJobIds = this.failQueuedItems(code, "TinyPNG API Key 无效，请更新 Key 后手动重新压缩");
+        if (item.tinypng_key_id) {
+          this.usage.recordValidation(item.tinypng_key_id, { valid: false, compressionCount: null, quotaExceeded: false });
+          affectedJobIds = this.failQueuedItemsForKey(item.tinypng_key_id, code, "该 TinyPNG API Key 无效，请切换 Key 后手动重新压缩");
+        }
+      } else if (code === "API_KEY_SECRET_MISSING" && item.tinypng_key_id) {
+        this.usage.recordError(item.tinypng_key_id, code);
+        affectedJobIds = this.failQueuedItemsForKey(item.tinypng_key_id, code, "该 TinyPNG API Key 密钥文件缺失，请切换 Key 后手动重新压缩");
       }
       const status = code === "OUTPUT_SKIPPED" ? "skipped" : "failed";
       this.db.prepare(
@@ -402,17 +417,36 @@ export class JobService {
     }
   }
 
-  private failQueuedItems(code: string, message: string): string[] {
+  private failQueuedItemsForKey(keyId: string, code: string, message: string): string[] {
     const jobs = this.db.prepare(
-      "SELECT DISTINCT job_id FROM job_items WHERE status='queued'"
-    ).all() as Array<{ job_id: string }>;
+      `SELECT DISTINCT ji.job_id FROM job_items ji JOIN compression_jobs cj ON cj.id=ji.job_id
+       WHERE ji.status='queued' AND cj.tinypng_key_id=?`
+    ).all(keyId) as Array<{ job_id: string }>;
     const now = new Date().toISOString();
     this.db.prepare(
-      `UPDATE job_items SET status='failed', error_code=?, error_message=?, finished_at=? WHERE status='queued'`
-    ).run(code, message, now);
+      `UPDATE job_items SET status='failed',error_code=?,error_message=?,finished_at=?
+       WHERE status='queued' AND job_id IN (SELECT id FROM compression_jobs WHERE tinypng_key_id=?)`
+    ).run(code, message, now, keyId);
     const jobIds = jobs.map(({ job_id: jobId }) => jobId);
     for (const jobId of jobIds) this.refreshJob(jobId);
     return jobIds;
+  }
+
+  private failBlockedQueuedItems(): void {
+    const blocked = this.db.prepare(
+      `SELECT DISTINCT cj.tinypng_key_id key_id,u.quota_state,u.last_validation_status
+       FROM compression_jobs cj JOIN job_items ji ON ji.job_id=cj.id
+       JOIN tinypng_api_usage u ON u.key_id=cj.tinypng_key_id
+       WHERE ji.status='queued' AND (u.quota_state='exhausted' OR u.last_validation_status='invalid')`
+    ).all() as Array<{ key_id: string; quota_state: string; last_validation_status: string }>;
+    for (const item of blocked) {
+      const exhausted = item.quota_state === "exhausted";
+      this.failQueuedItemsForKey(
+        item.key_id,
+        exhausted ? "QUOTA_EXHAUSTED" : "ACCOUNT_INVALID",
+        exhausted ? "该 API Key 本月免费额度已用尽，请切换 Key 后手动重新压缩" : "该 TinyPNG API Key 无效，请切换 Key 后手动重新压缩"
+      );
+    }
   }
 
   private refreshJob(jobId: string): void {

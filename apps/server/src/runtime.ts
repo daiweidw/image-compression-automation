@@ -8,6 +8,7 @@ import { initializeSessionState, openDatabase } from "./infrastructure/database.
 import { PathPolicy } from "./infrastructure/path-policy.js";
 import { TinyPngAdapter } from "./infrastructure/tinypng-adapter.js";
 import { TinyPngUsageService } from "./application/tinypng-usage-service.js";
+import { TinyPngKeyService } from "./application/tinypng-key-service.js";
 import { OutputWriter } from "./infrastructure/output-writer.js";
 import { SettingsService } from "./application/settings-service.js";
 import { ScannerService } from "./application/scanner-service.js";
@@ -120,22 +121,24 @@ export async function startLocalRuntime(options: LocalRuntimeOptions = {}): Prom
     const secrets = options.secretStore ?? new FileSecretStore(appDataDir);
     const pathPolicy = new PathPolicy();
     const tinypng = new TinyPngAdapter();
+    const keys = new TinyPngKeyService(db, secrets, tinypng);
+    await keys.migrateLegacy();
     const usage = new TinyPngUsageService(db, secrets, tinypng);
-    const settings = new SettingsService(appDataDir, db, secrets, pathPolicy, usage);
+    const settings = new SettingsService(appDataDir, db, keys, pathPolicy);
     await settings.ensureDefaults(options.platform?.downloadsPath ?? path.join(os.homedir(), "Downloads"));
     scanner = new ScannerService(db);
     const images = new ImageService(db, pathPolicy);
     const writer = new OutputWriter(pathPolicy);
     const outputs = new SessionOutputService(db, settings);
     settings.setSessionOutputDirectoryProvider(() => outputs.current());
-    jobs = new JobService(db, images, secrets, tinypng, writer, outputs, usage);
+    jobs = new JobService(db, images, keys, tinypng, writer, outputs, usage);
     const importAutomation = new ImportAutomationService(settings, images, jobs);
     scanner.setOnImage((event) => importAutomation.handleDetected(event));
     const production = options.production ?? process.env.NODE_ENV === "production";
     const lifecycle = new ApplicationLifecycle({ getActiveJobs: () => jobs!.getActiveCounts(), shutdown });
     const platform = options.platform ?? { capabilities: browserCapabilities };
     const app = await buildApp(
-      { db, settings, scanner, images, jobs, usage, importAutomation },
+      { db, settings, scanner, images, jobs, keys, usage, importAutomation },
       { production, lifecycle, platform, thumbnailCacheDir: path.join(appDataDir, "cache", "thumbnails"), ...(options.webRoot ? { webRoot: options.webRoot } : {}) }
     );
     appHolder.current = app;

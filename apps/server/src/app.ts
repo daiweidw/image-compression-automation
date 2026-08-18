@@ -16,6 +16,7 @@ import { ImageService } from "./application/image-service.js";
 import { JobService } from "./application/job-service.js";
 import { ApplicationLifecycle } from "./application/application-lifecycle.js";
 import { TinyPngUsageService } from "./application/tinypng-usage-service.js";
+import { TinyPngKeyService } from "./application/tinypng-key-service.js";
 import { ImportAutomationService } from "./application/import-automation-service.js";
 
 export interface PlatformIntegration {
@@ -31,6 +32,7 @@ export interface AppServices {
   scanner: ScannerService;
   images: ImageService;
   jobs: JobService;
+  keys: TinyPngKeyService;
   usage: TinyPngUsageService;
   importAutomation?: ImportAutomationService;
 }
@@ -41,9 +43,7 @@ const updateSettingsSchema = z.object({
   recursive: z.boolean(),
   compressionConcurrency: z.number().int().min(1).max(5),
   conflictStrategy: z.enum(["overwrite", "skip", "suffix"]),
-  createOutputDir: z.boolean(),
-  apiKeyAction: z.enum(["keep", "replace"]),
-  apiKey: z.string().nullable().optional()
+  createOutputDir: z.boolean()
 });
 
 const imageStatuses = ["pending", "queued", "compressing", "compressed", "source_changed", "output_missing", "failed", "unsupported"] as const;
@@ -60,7 +60,8 @@ export async function buildApp(
   };
   const defaultCapabilities: DesktopCapabilities = { desktop: false, nativeDirectoryPicker: false, fileDropPaths: false, revealInFinder: false, encryptedSecretStorage: false };
   services.jobs.setOnChange((jobId) => publish("job.changed", jobId));
-  services.usage.setOnChange(() => publish("tinypng.usage.changed"));
+  services.keys.setOnChange((keyId) => publish("tinypng.key.changed", keyId ?? undefined));
+  services.usage.setOnChange((keyId) => publish("tinypng.usage.changed", keyId));
   services.importAutomation?.setOnChange((event) => publish(event.type, event.imageId, {
     scanId: event.scanId,
     ...(event.imageStatus ? { imageStatus: event.imageStatus } : {}),
@@ -172,6 +173,37 @@ export async function buildApp(
     });
   });
   app.get("/api/settings", async (request) => ok(request, await services.settings.getResponse()));
+  app.get("/api/tinypng/keys", async (request) => ok(request, await services.keys.list()));
+  app.post("/api/tinypng/keys", async (request, reply) => {
+    const body = z.object({ name: z.string().min(1).max(30), apiKey: z.string().min(1).max(512) }).parse(request.body);
+    const result = await services.keys.create(body.name, body.apiKey);
+    publish("settings.changed");
+    return reply.status(201).send(ok(request, result));
+  });
+  app.patch("/api/tinypng/keys/:id", async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const { name } = z.object({ name: z.string().min(1).max(30) }).parse(request.body);
+    const result = await services.keys.rename(id, name);
+    return ok(request, result);
+  });
+  app.put("/api/tinypng/keys/active", async (request) => {
+    const { keyId } = z.object({ keyId: z.string() }).parse(request.body);
+    const result = await services.keys.activate(keyId);
+    publish("settings.changed");
+    return ok(request, result);
+  });
+  app.post("/api/tinypng/keys/:id/refresh", async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const result = await services.usage.refresh(id);
+    return ok(request, result.usage);
+  });
+  app.delete("/api/tinypng/keys/:id", async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const result = await services.keys.delete(id);
+    if (result.lastKeyRemoved) await services.settings.setAutoCompressOnImport(false);
+    publish("settings.changed");
+    return ok(request, { deleted: true });
+  });
   app.get("/api/tinypng/usage", async (request) => ok(request, await services.usage.getUsage()));
   app.post("/api/tinypng/usage/refresh", async (request) => {
     const result = await services.usage.refresh();
@@ -185,9 +217,7 @@ export async function buildApp(
       recursive: body.recursive,
       compressionConcurrency: body.compressionConcurrency,
       conflictStrategy: body.conflictStrategy,
-      createOutputDir: body.createOutputDir,
-      apiKeyAction: body.apiKeyAction,
-      ...(body.apiKey !== undefined ? { apiKey: body.apiKey } : {})
+      createOutputDir: body.createOutputDir
     });
     publish("settings.changed");
     return ok(request, result);
@@ -197,15 +227,6 @@ export async function buildApp(
     const result = await services.settings.setAutoCompressOnImport(body.enabled);
     publish("settings.changed");
     return ok(request, result);
-  });
-  app.post("/api/settings/test-tinypng", async (request) => {
-    const body = z.object({ candidateKey: z.string().optional() }).parse(request.body ?? {});
-    return ok(request, await services.settings.testKey(body.candidateKey));
-  });
-  app.delete("/api/settings/tinypng-key", async (request) => {
-    await services.settings.deleteKey();
-    publish("settings.changed");
-    return ok(request, { deleted: true });
   });
 
   app.post("/api/scans", async (request) => {

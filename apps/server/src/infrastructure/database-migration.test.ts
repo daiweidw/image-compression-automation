@@ -17,7 +17,7 @@ describe("database migrations", () => {
     legacy.close();
     const db = await openDatabase(root);
     expect(db.prepare("SELECT id,watch_enabled,auto_compress,conflict_strategy FROM workspaces").get()).toEqual({ id: "legacy", watch_enabled: 0, auto_compress: 0, conflict_strategy: "overwrite" });
-    expect(db.prepare("SELECT value FROM app_meta WHERE key='schema_version'").get()).toEqual({ value: "5" });
+    expect(db.prepare("SELECT value FROM app_meta WHERE key='schema_version'").get()).toEqual({ value: "6" });
     db.close();
   });
 
@@ -51,6 +51,28 @@ describe("database migrations", () => {
       usage_source: "cache",
       usage_period: "2026-08"
     });
+    db.close();
+  });
+
+  it("adds TinyPNG key columns before creating their job index", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ica-key-column-migration-test-"));
+    directories.push(root);
+    const legacy = new Database(path.join(root, "app.db"));
+    legacy.exec(`CREATE TABLE compression_jobs (
+      id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,client_request_id TEXT NOT NULL,output_root_path TEXT,
+      status TEXT NOT NULL,total INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,
+      failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,
+      input_bytes INTEGER NOT NULL DEFAULT 0,output_bytes INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,
+      started_at TEXT,finished_at TEXT
+    );`);
+    legacy.close();
+
+    const db = await openDatabase(root);
+
+    const columns = db.prepare("PRAGMA table_info(compression_jobs)").all() as Array<{ name: string }>;
+    expect(columns.map(({ name }) => name)).toEqual(expect.arrayContaining(["tinypng_key_id", "tinypng_key_name"]));
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_tinypng_key'").get())
+      .toEqual({ name: "idx_jobs_tinypng_key" });
     db.close();
   });
 });

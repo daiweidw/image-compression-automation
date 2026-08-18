@@ -11,61 +11,73 @@ const STARTUP_CLOSE_URL = "ica-startup://close";
 type StartupState = "starting" | "ready" | "failed" | "closing";
 
 class SafeStorageSecretStore implements SecretStore {
-  private readonly encryptedPath: string;
-  private readonly legacyPath: string;
+  private readonly directory: string;
+  private readonly legacyEncryptedPath: string;
+  private readonly legacyPlaintextPath: string;
 
   constructor(private readonly dataDir: string) {
-    this.encryptedPath = path.join(dataDir, "secrets", "tinypng.safe-storage");
-    this.legacyPath = path.join(dataDir, "secrets", "tinypng.key");
+    this.directory = path.join(dataDir, "secrets", "tinypng");
+    this.legacyEncryptedPath = path.join(dataDir, "secrets", "tinypng.safe-storage");
+    this.legacyPlaintextPath = path.join(dataDir, "secrets", "tinypng.key");
   }
 
-  async migrateLegacy(): Promise<void> {
+  async hasTinyPngKey(keyId: string): Promise<boolean> {
     try {
-      await fs.access(this.encryptedPath);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    try {
-      const legacy = (await fs.readFile(this.legacyPath, "utf8")).trim();
-      if (!legacy) return;
-      await this.setTinyPngKey(legacy);
-      if ((await this.getTinyPngKey()) === legacy) await fs.rm(this.legacyPath, { force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-
-  async hasTinyPngKey(): Promise<boolean> {
-    try {
-      await fs.access(this.encryptedPath);
+      await fs.access(this.keyPath(keyId));
       return true;
     } catch {
       return false;
     }
   }
 
-  async getTinyPngKey(): Promise<string | null> {
+  async getTinyPngKey(keyId: string): Promise<string | null> {
     try {
       if (!safeStorage.isEncryptionAvailable()) throw new Error("macOS 安全存储当前不可用");
-      return safeStorage.decryptString(await fs.readFile(this.encryptedPath)).trim();
+      return safeStorage.decryptString(await fs.readFile(this.keyPath(keyId))).trim();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
   }
 
-  async setTinyPngKey(value: string): Promise<void> {
+  async setTinyPngKey(keyId: string, value: string): Promise<void> {
     if (!safeStorage.isEncryptionAvailable()) throw new Error("macOS 安全存储当前不可用，API Key 未保存");
-    const directory = path.dirname(this.encryptedPath);
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-    const temporary = `${this.encryptedPath}.${process.pid}.tmp`;
+    await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    const keyPath = this.keyPath(keyId);
+    const temporary = `${keyPath}.${process.pid}.tmp`;
     await fs.writeFile(temporary, safeStorage.encryptString(value.trim()), { mode: 0o600 });
-    await fs.rename(temporary, this.encryptedPath);
+    await fs.rename(temporary, keyPath);
   }
 
-  async deleteTinyPngKey(): Promise<void> {
-    await Promise.all([fs.rm(this.encryptedPath, { force: true }), fs.rm(this.legacyPath, { force: true })]);
+  async deleteTinyPngKey(keyId: string): Promise<void> {
+    await fs.rm(this.keyPath(keyId), { force: true });
+  }
+
+  async getLegacyTinyPngKey(): Promise<string | null> {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error("macOS 安全存储当前不可用");
+    try {
+      return safeStorage.decryptString(await fs.readFile(this.legacyEncryptedPath)).trim() || null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    try {
+      return (await fs.readFile(this.legacyPlaintextPath, "utf8")).trim() || null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async deleteLegacyTinyPngKey(): Promise<void> {
+    await Promise.all([
+      fs.rm(this.legacyEncryptedPath, { force: true }),
+      fs.rm(this.legacyPlaintextPath, { force: true })
+    ]);
+  }
+
+  private keyPath(keyId: string): string {
+    if (!/^[0-9A-HJKMNP-TV-Z]{26}$/.test(keyId)) throw new Error("API Key ID 无效");
+    return path.join(this.directory, `${keyId}.safe-storage`);
   }
 }
 
@@ -205,7 +217,6 @@ async function startApplication(): Promise<void> {
       controller: startupController,
       timeoutMs: STARTUP_TIMEOUT_MS,
       prepare: async (signal) => {
-        await secrets.migrateLegacy();
         signal.throwIfAborted();
       },
       start: async (signal) => {

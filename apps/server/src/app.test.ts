@@ -9,7 +9,8 @@ afterEach(async () => {
 });
 
 function fakeServices() {
-  const usage = { configured: true, used: 12, limit: 500, remaining: 488, status: "available", updatedAt: "2026-08-14T00:00:00.000Z", stale: false, source: "cache" };
+  const usage = { keyId: "key-1", keyName: "工作账号", configured: true, used: 12, limit: 500, remaining: 488, status: "available", canCompress: true, lastValidationStatus: "valid", updatedAt: "2026-08-14T00:00:00.000Z", stale: false, source: "cache" };
+  const key = { id: "key-1", name: "工作账号", active: true, used: 12, limit: 500, remaining: 488, status: "available", canCompress: true, stale: false, source: "cache", lastValidationStatus: "valid", lastValidatedAt: "2026-08-14T00:00:00.000Z", updatedAt: "2026-08-14T00:00:00.000Z" };
   return {
     db: {} as any,
     settings: {
@@ -20,6 +21,14 @@ function fakeServices() {
     jobs: {
       setOnChange: vi.fn(),
       getActiveCounts: () => ({ queued: 0, running: 0 })
+    } as any,
+    keys: {
+      setOnChange: vi.fn(),
+      list: vi.fn(async () => ({ items: [key], activeKeyId: key.id })),
+      create: vi.fn(async () => key),
+      rename: vi.fn(async () => key),
+      activate: vi.fn(async () => key),
+      delete: vi.fn(async () => ({ deleted: true, lastKeyRemoved: false }))
     } as any,
     usage: {
       setOnChange: vi.fn(),
@@ -97,6 +106,40 @@ describe("TinyPNG usage API", () => {
     });
     expect(accepted.statusCode).toBe(200);
     expect(services.usage.refresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TinyPNG key management API", () => {
+  it("lists keys and protects adding a secret with the local token", async () => {
+    const services = fakeServices();
+    const app = await buildApp(services);
+    apps.push(app);
+
+    const listed = await app.inject({ method: "GET", url: "/api/tinypng/keys" });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().data).toMatchObject({ activeKeyId: "key-1", items: [{ name: "工作账号" }] });
+    const rejected = await app.inject({ method: "POST", url: "/api/tinypng/keys", payload: { name: "备用", apiKey: "secret" } });
+    expect(rejected.statusCode).toBe(403);
+
+    const session = await app.inject({ method: "GET", url: "/api/session" });
+    const accepted = await app.inject({
+      method: "POST",
+      url: "/api/tinypng/keys",
+      headers: { "x-local-app-token": session.json().data.token, origin: "http://127.0.0.1:43127" },
+      payload: { name: "备用", apiKey: "secret" }
+    });
+    expect(accepted.statusCode).toBe(201);
+    expect(services.keys.create).toHaveBeenCalledWith("备用", "secret");
+    expect(accepted.body).not.toContain("secret");
+
+    const renamed = await app.inject({
+      method: "PATCH",
+      url: "/api/tinypng/keys/key-1",
+      headers: { "x-local-app-token": session.json().data.token, origin: "http://127.0.0.1:43127" },
+      payload: { name: "新名称" }
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(services.keys.rename).toHaveBeenCalledWith("key-1", "新名称");
   });
 });
 

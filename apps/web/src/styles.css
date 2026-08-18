@@ -194,6 +194,10 @@ select { height: 34px; padding: 0 28px 0 10px; color: #384640; border: 1px solid
 .usage-panel header { display: flex; align-items: center; justify-content: space-between; }
 .usage-panel header > div { display: flex; flex-direction: column; gap: 4px; }
 .usage-panel header strong { font-size: 15px; }
+.active-key-select { width: 220px; height: 32px; padding-left: 8px; font-weight: 650; }
+.usage-count { display: flex; align-items: baseline; justify-content: space-between; margin-top: 12px; }
+.usage-count span { color: var(--muted); font-size: 9px; }
+.usage-count strong { font-size: 15px; }
 .usage-track { height: 5px; margin: 10px 0 8px; overflow: hidden; background: #e7ecea; border-radius: 3px; }
 .usage-track div { height: 100%; background: var(--green); transition: width .2s ease; }
 .usage-panel footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 9px; }
@@ -232,6 +236,28 @@ select { height: 34px; padding: 0 28px 0 10px; color: #384640; border: 1px solid
 .password-field input { border: 0 !important; box-shadow: none !important; }
 .key-state { margin-left: auto; padding: 3px 6px; color: #866029; background: #f5eddf; border-radius: 4px; font-size: 9px; }
 .key-state.configured { color: var(--green-dark); background: var(--green-soft); }
+.key-list { overflow: hidden; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 6px; }
+.key-list-item { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.key-list-item:last-child { border-bottom: 0; }
+.key-list-item.active { background: #f1f8f5; }
+.key-list-main { min-width: 0; flex: 1; display: flex; align-items: center; gap: 9px; }
+.key-list-main > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.key-list-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.key-list-main > div > span { color: var(--muted); font-size: 9px; }
+.key-list-main .key-list-details { flex: 1; }
+.key-list-main .key-rename-input { width: min(220px, 100%); height: 30px; padding: 0 8px; font-size: 12px; }
+.key-status-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #9aa6a1; }
+.key-status-dot.usage-available { background: var(--green); }
+.key-status-dot.usage-warning { background: var(--amber); }
+.key-status-dot.usage-exhausted { background: var(--red); }
+.key-status-dot.usage-invalid { background: var(--red); }
+.active-key-label { display: inline-flex; align-items: center; gap: 3px; padding: 3px 5px; color: var(--green-dark); background: var(--green-soft); border-radius: 4px; font-size: 9px; font-weight: 700; }
+.key-list-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 3px; }
+.compact-button { min-height: 28px; padding: 0 9px; font-size: 10px; }
+.danger-icon { color: var(--red); }
+.add-key-form { display: grid; grid-template-columns: minmax(120px, .7fr) minmax(220px, 1.6fr) auto; align-items: end; gap: 8px; }
+.add-key-form label { min-width: 0; margin-top: 0; }
+.add-key-button { height: 38px; white-space: nowrap; }
 .security-note { display: flex; align-items: flex-start; gap: 7px; margin-top: 10px; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .security-note svg { flex: 0 0 auto; color: var(--green); }
 .settings-usage { min-height: 42px; display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding: 8px 10px; color: #3d4b46; background: #f5f7f6; border: 1px solid var(--border); border-radius: 6px; }
@@ -325,4 +351,14 @@ select { height: 34px; padding: 0 28px 0 10px; color: #384640; border: 1px solid
   .summary-main, .summary-cell { padding: 0 12px; }
   .directory-context > span:not(.path-arrow) { max-width: 170px; }
   .image-table th:nth-child(7), .image-table td:nth-child(7) { display: none; }
+}
+
+@media (max-width: 700px) {
+  .modal-backdrop, .setup-page { padding: 12px; }
+  .settings-panel { max-height: calc(100vh - 24px); }
+  .key-list-item { align-items: flex-start; flex-direction: column; }
+  .key-list-actions { width: 100%; justify-content: flex-end; }
+  .add-key-form { grid-template-columns: 1fr; }
+  .add-key-button { width: 100%; }
+  .active-key-select { width: min(220px, calc(100vw - 120px)); }
 }

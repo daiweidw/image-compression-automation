@@ -5,7 +5,6 @@ import { TransformComponent, TransformWrapper } from "react-zoom-pan-pinch";
 import {
   AlertCircle,
   Check,
-  CircleGauge,
   Columns2,
   Download,
   Eye,
@@ -18,6 +17,8 @@ import {
   KeyRound,
   LoaderCircle,
   Maximize2,
+  Pencil,
+  Plus,
   Power,
   RefreshCw,
   RotateCcw,
@@ -32,7 +33,7 @@ import {
   ZoomIn,
   ZoomOut
 } from "lucide-react";
-import { TINYPNG_FREE_MONTHLY_LIMIT, type ApplicationStatus, type DesktopCapabilities, type ImageItem, type ImageListResponse, type ImageStatus, type JobListResponse, type JobView, type LocalAppEvent, type ScanState, type SettingsResponse, type ShutdownResponse, type TinyPngUsage, type UpdateSettingsRequest } from "@ica/contracts";
+import { TINYPNG_FREE_MONTHLY_LIMIT, type ApplicationStatus, type DesktopCapabilities, type ImageItem, type ImageListResponse, type ImageStatus, type JobListResponse, type JobView, type LocalAppEvent, type ScanState, type SettingsResponse, type ShutdownResponse, type TinyPngKeyListResponse, type TinyPngKeyView, type TinyPngUsage, type UpdateSettingsRequest } from "@ica/contracts";
 import { api, ApiError } from "./lib/api";
 
 declare global {
@@ -86,13 +87,16 @@ function ErrorBanner({ error, onClose }: { error: unknown; onClose: () => void }
   );
 }
 
-function SettingsPanel({ settings, capabilities, usage, refreshingUsage, onRefreshUsage, onClose, onRequestShutdown }: { settings: SettingsResponse; capabilities: DesktopCapabilities; usage: TinyPngUsage; refreshingUsage: boolean; onRefreshUsage: () => void; onClose?: () => void; onRequestShutdown: () => void }) {
+function SettingsPanel({ settings, capabilities, keys, refreshingKeyId, keyActionError, onRefreshKey, onClearKeyActionError, onClose, onRequestShutdown }: { settings: SettingsResponse; capabilities: DesktopCapabilities; keys: TinyPngKeyListResponse; refreshingKeyId: string | null; keyActionError: unknown; onRefreshKey: (keyId: string) => void; onClearKeyActionError: () => void; onClose?: () => void; onRequestShutdown: () => void }) {
   const queryClient = useQueryClient();
   const [concurrency, setConcurrency] = useState(settings.compressionConcurrency);
+  const [keyName, setKeyName] = useState("");
   const [key, setKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
+  const [renamingKeyId, setRenamingKeyId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   const save = useMutation({
     mutationFn: async () => {
@@ -102,39 +106,94 @@ function SettingsPanel({ settings, capabilities, usage, refreshingUsage, onRefre
         recursive: true,
         compressionConcurrency: concurrency,
         conflictStrategy: "suffix",
-        createOutputDir: true,
-        apiKeyAction: key.trim() ? "replace" : "keep",
-        apiKey: key.trim() || null
+        createOutputDir: true
       };
       return api<SettingsResponse>("/api/settings", { method: "PUT", body: JSON.stringify(body) });
     },
     onSuccess: async () => {
-      setKey("");
       setMessage("设置已保存");
-      await queryClient.invalidateQueries();
+      await queryClient.invalidateQueries({ queryKey: ["settings"] });
       onClose?.();
     },
     onError: (failure) => {
       setError(failure);
     }
   });
-  const test = useMutation({
-    mutationFn: () => api<{ valid: boolean; compressionCount: number | null; quotaExceeded: boolean }>("/api/settings/test-tinypng", { method: "POST", body: JSON.stringify(key.trim() ? { candidateKey: key.trim() } : {}) }),
-    onSuccess: (result) => {
+  const addKey = useMutation({
+    mutationFn: () => api<TinyPngKeyView>("/api/tinypng/keys", { method: "POST", body: JSON.stringify({ name: keyName.trim(), apiKey: key.trim() }) }),
+    onSuccess: async (result) => {
+      setKeyName("");
+      setKey("");
       setError(null);
-      setMessage(result.valid ? result.quotaExceeded ? "API Key 有效，但本月免费额度已用尽" : `连接成功${result.compressionCount == null ? "" : `，本月已用 ${result.compressionCount} 次`}` : "API Key 无效");
-      void queryClient.invalidateQueries({ queryKey: ["settings"] });
+      setMessage(`${result.name} 已添加`);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["tinypng-keys"] }),
+        queryClient.invalidateQueries({ queryKey: ["tinypng-usage"] }),
+        queryClient.invalidateQueries({ queryKey: ["settings"] })
+      ]);
+    },
+    onError: setError
+  });
+  const activateKey = useMutation({
+    mutationFn: (keyId: string) => api<TinyPngKeyView>("/api/tinypng/keys/active", { method: "PUT", body: JSON.stringify({ keyId }) }),
+    onSuccess: async (result) => {
+      setMessage(`已切换到 ${result.name}`);
+      await queryClient.invalidateQueries();
+    },
+    onError: setError
+  });
+  const renameKey = useMutation({
+    mutationFn: ({ keyId, name }: { keyId: string; name: string }) => api<TinyPngKeyView>(`/api/tinypng/keys/${keyId}`, { method: "PATCH", body: JSON.stringify({ name }) }),
+    onSuccess: async () => {
+      setRenamingKeyId(null);
+      setRenameValue("");
+      setError(null);
+      setMessage("名称已更新");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["tinypng-keys"] }),
+        queryClient.invalidateQueries({ queryKey: ["tinypng-usage"] }),
+        queryClient.invalidateQueries({ queryKey: ["settings"] })
+      ]);
     },
     onError: setError
   });
   const removeKey = useMutation({
-    mutationFn: () => api<{ deleted: boolean }>("/api/settings/tinypng-key", { method: "DELETE" }),
+    mutationFn: (keyId: string) => api<{ deleted: boolean }>(`/api/tinypng/keys/${keyId}`, { method: "DELETE" }),
     onSuccess: async () => {
       setMessage("API Key 已删除");
-      await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      await queryClient.invalidateQueries();
     },
     onError: setError
   });
+
+  const beginRename = (item: TinyPngKeyView) => {
+    setError(null);
+    setMessage(null);
+    setRenamingKeyId(item.id);
+    setRenameValue(item.name);
+  };
+  const cancelRename = () => {
+    if (renameKey.isPending) return;
+    setRenamingKeyId(null);
+    setRenameValue("");
+    setError(null);
+  };
+  const submitRename = (item: TinyPngKeyView) => {
+    const name = renameValue.trim();
+    if (!name) {
+      setError(new Error("API Key 名称不能为空"));
+      return;
+    }
+    if ([...name].length > 30) {
+      setError(new Error("API Key 名称不能超过 30 个字符"));
+      return;
+    }
+    if (name === item.name) {
+      cancelRename();
+      return;
+    }
+    renameKey.mutate({ keyId: item.id, name });
+  };
 
   return (
     <div className={onClose ? "modal-backdrop" : "setup-page"}>
@@ -146,8 +205,9 @@ function SettingsPanel({ settings, capabilities, usage, refreshingUsage, onRefre
           </div>
           {onClose && <button className="icon-button" onClick={onClose} title="关闭设置"><X size={20} /></button>}
         </header>
-        {!settings.apiKey.configured && <p className="setup-lead">填写 TinyPNG API Key 后即可开始压缩。</p>}
+        {!settings.apiKey.configured && <p className="setup-lead">添加 TinyPNG API Key 后即可开始压缩。</p>}
         {error !== null && <ErrorBanner error={error} onClose={() => setError(null)} />}
+        {error === null && keyActionError !== null && <ErrorBanner error={keyActionError} onClose={onClearKeyActionError} />}
         {message && <div className="success-banner"><Check size={17} />{message}</div>}
 
         <div className="form-section compact-settings-section">
@@ -156,20 +216,41 @@ function SettingsPanel({ settings, capabilities, usage, refreshingUsage, onRefre
         </div>
 
         <div className="form-section">
-          <div className="form-section-title"><KeyRound size={18} /><span>TinyPNG API Key</span><span className={`key-state ${settings.apiKey.configured ? "configured" : ""}`}>{settings.apiKey.configured ? "已配置" : "未配置"}</span></div>
-          <label>
-            <span>{settings.apiKey.configured ? "输入新 Key 可更换，留空则保持不变" : "API Key"}</span>
+          <div className="form-section-title"><KeyRound size={18} /><span>TinyPNG API Key</span><span className={`key-state ${keys.items.length ? "configured" : ""}`}>{keys.items.length ? `${keys.items.length} 个` : "未配置"}</span></div>
+          {keys.items.length > 0 && <div className="key-list">{keys.items.map((item) => {
+            const editing = renamingKeyId === item.id;
+            const renameCandidate = renameValue.trim();
+            const canSubmitRename = Boolean(renameCandidate && [...renameCandidate].length <= 30 && renameCandidate !== item.name);
+            return <div className={`key-list-item ${item.active ? "active" : ""}`} key={item.id}>
+              <div className="key-list-main"><span className={`key-status-dot usage-${item.lastValidationStatus === "invalid" ? "invalid" : item.status}`} /><div className="key-list-details">{editing
+                ? <input className="key-rename-input" aria-label={`重命名 ${item.name}`} value={renameValue} maxLength={30} autoFocus disabled={renameKey.isPending} onFocus={(event) => event.currentTarget.select()} onChange={(event) => { setRenameValue(event.target.value); setError(null); }} onKeyDown={(event) => {
+                  if (event.nativeEvent.isComposing) return;
+                  if (event.key === "Enter") { event.preventDefault(); submitRename(item); }
+                  if (event.key === "Escape") { event.preventDefault(); cancelRename(); }
+                }} />
+                : <strong>{item.name}</strong>}<span>{item.lastValidationStatus === "invalid" ? "API Key 无效" : item.used == null ? "额度未知" : `${item.used} / ${item.limit}，剩余 ${item.remaining} 次`}</span></div>{item.active && <span className="active-key-label"><Check size={12} />当前</span>}</div>
+              <div className="key-list-actions">{editing ? <>
+                <button className="icon-button mini" onClick={() => submitRename(item)} disabled={renameKey.isPending || !canSubmitRename} title="确认重命名" aria-label="确认重命名">{renameKey.isPending ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}</button>
+                <button className="icon-button mini" onClick={cancelRename} disabled={renameKey.isPending} title="取消重命名" aria-label="取消重命名"><X size={14} /></button>
+              </> : <>
+                {!item.active && <button className="secondary-button compact-button" onClick={() => activateKey.mutate(item.id)} disabled={activateKey.isPending}>设为当前</button>}
+                <button className="icon-button mini" onClick={() => onRefreshKey(item.id)} disabled={refreshingKeyId === item.id} title={`刷新 ${item.name} 额度`}>{refreshingKeyId === item.id ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}</button>
+                <button className="icon-button mini" onClick={() => beginRename(item)} disabled={renameKey.isPending} title={`重命名 ${item.name}`}><Pencil size={14} /></button>
+                <button className="icon-button mini danger-icon" onClick={() => window.confirm(`确定删除“${item.name}”？`) && removeKey.mutate(item.id)} disabled={removeKey.isPending || (item.active && keys.items.length > 1)} title={item.active && keys.items.length > 1 ? "请先切换到其他 Key" : `删除 ${item.name}`}><Trash2 size={14} /></button>
+              </>}</div>
+            </div>;
+          })}</div>}
+          <div className="add-key-form">
+            <label><span>名称</span><input autoComplete="off" value={keyName} onChange={(event) => setKeyName(event.target.value)} placeholder="例如：工作账号" maxLength={30} /></label>
+            <label><span>API Key</span>
             <div className="password-field">
-              <input type={showKey ? "text" : "password"} autoComplete="off" value={key} onChange={(event) => setKey(event.target.value)} placeholder={settings.apiKey.configured ? "输入新 Key" : "从 TinyPNG API Dashboard 获取"} />
+              <input type={showKey ? "text" : "password"} autoComplete="off" value={key} onChange={(event) => setKey(event.target.value)} placeholder="从 TinyPNG API Dashboard 获取" />
               <button className="icon-button" onClick={() => setShowKey((value) => !value)} title={showKey ? "隐藏 API Key" : "显示 API Key"}>{showKey ? <EyeOff size={18} /> : <Eye size={18} />}</button>
             </div>
-          </label>
-          <div className="security-note"><ShieldCheck size={16} /><span>{capabilities.encryptedSecretStorage ? "Key 已由 macOS 系统安全存储加密，不会返回页面。" : "Key 仅保存到本机后端，不会返回浏览器。"} 图片压缩时会上传至 TinyPNG。</span></div>
-          {usage.configured && <div className={`settings-usage usage-${usage.status}`}><div><span>本月免费额度</span><strong>{usage.used == null ? "额度未知" : `${usage.used} / ${usage.limit}`}</strong></div><button className="icon-button mini" onClick={onRefreshUsage} disabled={refreshingUsage} title="刷新 TinyPNG 额度" aria-label="刷新 TinyPNG 额度">{refreshingUsage ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}</button></div>}
-          <div className="key-actions">
-            <button className="secondary-button" onClick={() => test.mutate()} disabled={test.isPending || (!key.trim() && !settings.apiKey.configured)}>{test.isPending ? <LoaderCircle className="spin" size={16} /> : <CircleGauge size={16} />}测试连接</button>
-            {settings.apiKey.configured && <button className="danger-text-button" onClick={() => window.confirm("确定删除已保存的 API Key？") && removeKey.mutate()} disabled={removeKey.isPending}><Trash2 size={16} />删除 Key</button>}
+            </label>
+            <button className="secondary-button add-key-button" onClick={() => addKey.mutate()} disabled={addKey.isPending || !keyName.trim() || !key.trim()}>{addKey.isPending ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}添加 Key</button>
           </div>
+          <div className="security-note"><ShieldCheck size={16} /><span>{capabilities.encryptedSecretStorage ? "Key 已由 macOS 系统安全存储加密，不会返回页面。" : "Key 仅保存到本机后端，不会返回浏览器。"} 图片压缩时会上传至 TinyPNG。</span></div>
         </div>
 
         <footer className="panel-footer">
@@ -254,34 +335,39 @@ function PreviewDialog({ image, capabilities, onClose }: { image: ImageItem; cap
   );
 }
 
-function UsagePanel({ usage, refreshing, onRefresh }: { usage: TinyPngUsage; refreshing: boolean; onRefresh: () => void }) {
+function UsagePanel({ usage, keys, refreshing, switching, onRefresh, onActivate }: { usage: TinyPngUsage; keys: TinyPngKeyListResponse; refreshing: boolean; switching: boolean; onRefresh: () => void; onActivate: (keyId: string) => void }) {
   const percentage = usage.used == null ? 0 : Math.min(100, (usage.used / usage.limit) * 100);
   const detail = !usage.configured
     ? "尚未配置 API Key"
-    : usage.status === "unknown"
-      ? "尚未获取用量"
-      : usage.status === "exhausted"
-        ? "本月免费额度已用尽"
-        : `剩余 ${usage.remaining} 次`;
-  return <section className={`usage-panel usage-${usage.status}`} aria-label="TinyPNG 本月额度"><header><div><span className="eyebrow">TinyPNG 本月额度</span><strong>{usage.used == null ? `- / ${usage.limit}` : `${usage.used} / ${usage.limit}`}</strong></div><button className="icon-button mini" onClick={onRefresh} disabled={refreshing || !usage.configured} title="刷新 TinyPNG 额度" aria-label="刷新 TinyPNG 额度">{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}</button></header><div className="usage-track" role="progressbar" aria-label="TinyPNG 本月额度使用比例" aria-valuemin={0} aria-valuemax={usage.limit} aria-valuenow={usage.used ?? 0}><div style={{ width: `${percentage}%` }} /></div><footer><span>{detail}</span><span>{usage.stale ? "数据待刷新" : usage.updatedAt ? formatTime(usage.updatedAt) : ""}</span></footer></section>;
+    : usage.lastValidationStatus === "invalid"
+      ? "当前 API Key 无效"
+      : usage.lastValidationStatus === "unknown"
+        ? "当前 API Key 尚未验证"
+        : usage.status === "unknown"
+          ? "尚未获取用量"
+          : usage.status === "exhausted"
+            ? "本月免费额度已用尽"
+            : `剩余 ${usage.remaining} 次`;
+  const visualStatus = usage.lastValidationStatus === "invalid" ? "exhausted" : usage.status;
+  return <section className={`usage-panel usage-${visualStatus}`} aria-label="TinyPNG 本月额度"><header><div><span className="eyebrow">当前 API Key</span><select className="active-key-select" aria-label="切换当前 TinyPNG API Key" value={usage.keyId ?? ""} disabled={switching || keys.items.length === 0} onChange={(event) => onActivate(event.target.value)}><option value="" disabled>未配置</option>{keys.items.map((item) => <option value={item.id} key={item.id}>{item.name}{item.lastValidationStatus === "invalid" ? " · 无效" : item.remaining == null ? " · 额度未知" : ` · 剩余 ${item.remaining}`}</option>)}</select></div><button className="icon-button mini" onClick={onRefresh} disabled={refreshing || !usage.configured} title="刷新当前 Key 额度" aria-label="刷新当前 Key 额度">{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}</button></header><div className="usage-count"><span>本月额度</span><strong>{usage.used == null ? `- / ${usage.limit}` : `${usage.used} / ${usage.limit}`}</strong></div><div className="usage-track" role="progressbar" aria-label="TinyPNG 本月额度使用比例" aria-valuemin={0} aria-valuemax={usage.limit} aria-valuenow={usage.used ?? 0}><div style={{ width: `${percentage}%` }} /></div><footer><span>{detail}</span><span>{usage.stale ? "数据待刷新" : usage.updatedAt ? formatTime(usage.updatedAt) : ""}</span></footer></section>;
 }
 
-function JobPanel({ jobs, usage, refreshingUsage, onRefreshUsage }: { jobs: JobView[]; usage: TinyPngUsage; refreshingUsage: boolean; onRefreshUsage: () => void }) {
+function JobPanel({ jobs, usage, keys, refreshingUsage, switchingKey, onRefreshUsage, onActivateKey }: { jobs: JobView[]; usage: TinyPngUsage; keys: TinyPngKeyListResponse; refreshingUsage: boolean; switchingKey: boolean; onRefreshUsage: () => void; onActivateKey: (keyId: string) => void }) {
   const queryClient = useQueryClient();
   const cancel = useMutation({ mutationFn: (id: string) => api(`/api/jobs/${id}/cancel`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }) });
   const retry = useMutation({ mutationFn: (id: string) => api(`/api/job-items/${id}/retry`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries() });
   const reveal = useMutation({ mutationFn: (id: string) => api(`/api/jobs/${id}/reveal-output`, { method: "POST", body: "{}" }) });
   const latest = jobs[0];
-  if (!latest) return <aside className="job-panel"><UsagePanel usage={usage} refreshing={refreshingUsage} onRefresh={onRefreshUsage} /><div className="empty-jobs"><Sparkles size={22} /><strong>本次还没有压缩任务</strong><span>从待压缩列表中选择图片开始</span></div></aside>;
+  if (!latest) return <aside className="job-panel"><UsagePanel usage={usage} keys={keys} refreshing={refreshingUsage} switching={switchingKey} onRefresh={onRefreshUsage} onActivate={onActivateKey} /><div className="empty-jobs"><Sparkles size={22} /><strong>本次还没有压缩任务</strong><span>从待压缩列表中选择图片开始</span></div></aside>;
   const complete = latest.succeeded + latest.failed + latest.cancelled + latest.skipped;
   return (
     <aside className="job-panel">
-      <UsagePanel usage={usage} refreshing={refreshingUsage} onRefresh={onRefreshUsage} />
+      <UsagePanel usage={usage} keys={keys} refreshing={refreshingUsage} switching={switchingKey} onRefresh={onRefreshUsage} onActivate={onActivateKey} />
       <div className="job-heading"><div><span className="eyebrow">本批次</span><strong>{latest.status === "running" || latest.status === "queued" ? "正在处理" : "处理结果"}</strong></div><span>{complete}/{latest.total}</span></div>
       <div className="progress-track"><div style={{ width: `${latest.total ? (complete / latest.total) * 100 : 0}%` }} /></div>
       <div className="job-stats"><span className="success-dot">成功 {latest.succeeded}</span><span className="failure-dot">失败 {latest.failed}</span><span>节省 {formatBytes(Math.max(0, latest.inputBytes - latest.outputBytes))}</span></div>
       <div className="job-items">
-        {latest.items.slice(0, 8).map((item) => <div className="job-item" key={item.id}><span className={`job-indicator job-${item.status}`}>{item.status === "running" ? <LoaderCircle className="spin" size={14} /> : item.status === "succeeded" ? <Check size={14} /> : item.status === "failed" ? <AlertCircle size={14} /> : <span />}</span><div><strong title={item.relativePath}>{item.filename}</strong><span>{item.status === "failed" ? item.errorMessage : item.status === "succeeded" ? `${formatBytes(item.inputSize)} → ${formatBytes(item.outputSize)}` : item.status === "running" ? "上传并压缩中" : "等待处理"}</span></div>{item.status === "failed" && usage.status !== "exhausted" && <button className="secondary-button retry-button" onClick={() => retry.mutate(item.id)} disabled={retry.isPending || !usage.configured}><RotateCcw size={14} />重新压缩</button>}</div>)}
+        {latest.items.slice(0, 8).map((item) => <div className="job-item" key={item.id}><span className={`job-indicator job-${item.status}`}>{item.status === "running" ? <LoaderCircle className="spin" size={14} /> : item.status === "succeeded" ? <Check size={14} /> : item.status === "failed" ? <AlertCircle size={14} /> : <span />}</span><div><strong title={item.relativePath}>{item.filename}</strong><span>{item.status === "failed" ? item.errorMessage : item.status === "succeeded" ? `${formatBytes(item.inputSize)} → ${formatBytes(item.outputSize)}` : item.status === "running" ? "上传并压缩中" : "等待处理"}</span></div>{item.status === "failed" && <button className="secondary-button retry-button" onClick={() => retry.mutate(item.id)} disabled={retry.isPending || !usage.canCompress}><RotateCcw size={14} />重新压缩</button>}</div>)}
       </div>
       <div className="job-output" title={latest.outputDir}><Download size={14} /><span>{latest.outputDir}</span></div>
       <div className="job-controls">{["running", "queued"].includes(latest.status) && <button className="secondary-button" onClick={() => cancel.mutate(latest.id)}>取消剩余</button>}{latest.outputDir && <button className="secondary-button" onClick={() => reveal.mutate(latest.id)}><FolderOpen size={14} />打开结果</button>}</div>
@@ -289,7 +375,7 @@ function JobPanel({ jobs, usage, refreshingUsage, onRefreshUsage }: { jobs: JobV
   );
 }
 
-function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUsage, onOpenSettings, onRequestShutdown }: { settings: SettingsResponse; capabilities: DesktopCapabilities; usage: TinyPngUsage; refreshingUsage: boolean; onRefreshUsage: () => void; onOpenSettings: () => void; onRequestShutdown: () => void }) {
+function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switchingKey, keyActionError, onRefreshUsage, onActivateKey, onClearKeyActionError, onOpenSettings, onRequestShutdown }: { settings: SettingsResponse; capabilities: DesktopCapabilities; usage: TinyPngUsage; keys: TinyPngKeyListResponse; refreshingUsage: boolean; switchingKey: boolean; keyActionError: unknown; onRefreshUsage: () => void; onActivateKey: (keyId: string) => void; onClearKeyActionError: () => void; onOpenSettings: () => void; onRequestShutdown: () => void }) {
   const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
@@ -342,7 +428,8 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
       if (["connected", "image.detected", "scan.changed"].includes(event.type)) void queryClient.invalidateQueries({ queryKey: ["scan"] });
       if (["connected", "auto-job.created", "job.changed"].includes(event.type)) void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       if (["connected", "settings.changed", "auto-job.created"].includes(event.type)) void queryClient.invalidateQueries({ queryKey: ["settings"] });
-      if (["connected", "tinypng.usage.changed", "job.changed"].includes(event.type)) void queryClient.invalidateQueries({ queryKey: ["tinypng-usage"] });
+      if (["connected", "tinypng.usage.changed", "tinypng.key.changed", "job.changed"].includes(event.type)) void queryClient.invalidateQueries({ queryKey: ["tinypng-usage"] });
+      if (["connected", "tinypng.usage.changed", "tinypng.key.changed"].includes(event.type)) void queryClient.invalidateQueries({ queryKey: ["tinypng-keys"] });
     };
     return () => events.close();
   }, [queryClient]);
@@ -389,8 +476,7 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
         recursive: true,
         compressionConcurrency: settings.compressionConcurrency,
         conflictStrategy: "suffix",
-        createOutputDir: true,
-        apiKeyAction: "keep"
+        createOutputDir: true
       };
       return api<SettingsResponse>("/api/settings", { method: "PUT", body: JSON.stringify(body) });
     },
@@ -406,8 +492,7 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
         recursive: true,
         compressionConcurrency: settings.compressionConcurrency,
         conflictStrategy: "suffix",
-        createOutputDir: true,
-        apiKeyAction: "keep"
+        createOutputDir: true
       } satisfies UpdateSettingsRequest)
     }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
@@ -509,7 +594,8 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
       <main className="workspace-layout">
         <section className="library-section">
           {error !== null && <ErrorBanner error={error} onClose={() => setError(null)} />}
-          {usage.status === "exhausted" && <div className="quota-alert" role="alert"><AlertCircle size={18} /><div><strong>TinyPNG 本月免费额度已用尽</strong><span>未开始的图片已标记失败；额度恢复后刷新状态，再逐项重新压缩。</span></div><button className="secondary-button" onClick={onRefreshUsage} disabled={refreshingUsage}>{refreshingUsage ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}刷新额度</button></div>}
+          {error === null && keyActionError !== null && <ErrorBanner error={keyActionError} onClose={onClearKeyActionError} />}
+          {usage.status === "exhausted" && <div className="quota-alert" role="alert"><AlertCircle size={18} /><div><strong>{usage.keyName ?? "当前 Key"} 本月免费额度已用尽</strong><span>切换到其他可用 Key 后，可手动重新压缩失败项。</span></div><button className="secondary-button" onClick={onOpenSettings}><KeyRound size={15} />切换 Key</button></div>}
           <div
             className={`import-zone ${dragTarget === "import" ? "drag-active" : ""}`}
             onDragEnter={(event) => handleDragEnter("import", event)}
@@ -539,7 +625,7 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
             <select aria-label="排序" value={sort} onChange={(event) => setSort(event.target.value)}><option value="filename">文件名</option><option value="sourceSize">文件大小</option><option value="sourceMtime">更新时间</option><option value="compressedAt">压缩时间</option><option value="savedRatio">节省比例</option></select>
           </div>
 
-          {(selected.size > 0 || selectable.length > 0) && <div className="selection-bar"><span>已选择 <strong>{selected.size}</strong> 张</span><button className="text-button" onClick={() => void selectAllFiltered()}>选择全部筛选结果</button>{selected.size > 0 && <><button className="text-button" onClick={() => setSelected(new Set())}>取消选择</button><button className="danger-text-button" onClick={() => removeImages.mutate({ ids: [...selected] })} disabled={removeImages.isPending}><Trash2 size={14} />移出列表</button></>}<button className="primary-button" onClick={startCompression} disabled={selected.size === 0 || compress.isPending || !settings.apiKey.configured || usage.status === "exhausted"}>{compress.isPending ? <LoaderCircle className="spin" size={16} /> : usage.status === "exhausted" ? <AlertCircle size={16} /> : <Sparkles size={16} />}{!settings.apiKey.configured ? "先配置 API Key" : usage.status === "exhausted" ? "额度已用尽" : "开始压缩"}</button></div>}
+          {(selected.size > 0 || selectable.length > 0) && <div className="selection-bar"><span>已选择 <strong>{selected.size}</strong> 张</span><button className="text-button" onClick={() => void selectAllFiltered()}>选择全部筛选结果</button>{selected.size > 0 && <><button className="text-button" onClick={() => setSelected(new Set())}>取消选择</button><button className="danger-text-button" onClick={() => removeImages.mutate({ ids: [...selected] })} disabled={removeImages.isPending}><Trash2 size={14} />移出列表</button></>}<button className="primary-button" onClick={startCompression} disabled={selected.size === 0 || compress.isPending || !usage.canCompress}>{compress.isPending ? <LoaderCircle className="spin" size={16} /> : !usage.canCompress ? <AlertCircle size={16} /> : <Sparkles size={16} />}{!usage.configured ? "先配置 API Key" : usage.status === "exhausted" ? "切换 API Key" : !usage.canCompress ? "当前 Key 不可用" : "开始压缩"}</button></div>}
 
           <div
             className={`table-wrap virtual-table-wrap ${dragTarget === "list" ? "drag-active" : ""}`}
@@ -558,7 +644,7 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
                   const image = images[virtualRow.index]!;
                   const canSelect = compressibleStatuses.has(image.status);
                   const canRemove = !["queued", "compressing"].includes(image.status);
-                  return <tr key={image.id} data-index={virtualRow.index} style={{ transform: `translateY(${virtualRow.start}px)` }} className={selected.has(image.id) ? "selected-row" : ""}><td><input type="checkbox" aria-label={`选择 ${image.filename}`} disabled={!canSelect} checked={selected.has(image.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(image.id)) next.delete(image.id); else next.add(image.id); return next; })} /></td><td><button className="image-cell" onClick={() => setPreview(image)}><img src={`/api/images/${image.id}/thumbnail`} alt="" loading="lazy" /><span><strong title={image.filename}>{image.filename}</strong><small title={image.sourceDirectory}>{image.relativePath}</small></span></button></td><td><StatusPill status={image.status} />{image.errorMessage && <span className="row-error" title={image.errorMessage}><AlertCircle size={14} /></span>}</td><td><strong>{formatBytes(image.sourceSize)}</strong><small>{image.width && image.height ? `${image.width} × ${image.height}` : image.extension.toUpperCase()}</small></td><td><strong>{formatBytes(image.outputSize)}</strong><small>{formatTime(image.compressedAt)}</small></td><td>{image.savedRatio == null ? <span className="muted">-</span> : <strong className="saved-value">-{(image.savedRatio * 100).toFixed(1)}%</strong>}</td><td><span className="muted">{formatTime(image.sourceMtime)}</span></td><td><div className="row-actions">{image.retryItemId && <button className="secondary-button retry-button" onClick={() => retryItem.mutate(image.retryItemId!)} disabled={retryItem.isPending || !settings.apiKey.configured}><RotateCcw size={13} />重新压缩</button>}<button className="icon-button mini" onClick={() => removeImages.mutate({ ids: [image.id] })} disabled={!canRemove || removeImages.isPending} title="移出待压缩列表"><Trash2 size={14} /></button></div></td></tr>;
+                  return <tr key={image.id} data-index={virtualRow.index} style={{ transform: `translateY(${virtualRow.start}px)` }} className={selected.has(image.id) ? "selected-row" : ""}><td><input type="checkbox" aria-label={`选择 ${image.filename}`} disabled={!canSelect} checked={selected.has(image.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(image.id)) next.delete(image.id); else next.add(image.id); return next; })} /></td><td><button className="image-cell" onClick={() => setPreview(image)}><img src={`/api/images/${image.id}/thumbnail`} alt="" loading="lazy" /><span><strong title={image.filename}>{image.filename}</strong><small title={image.sourceDirectory}>{image.relativePath}</small></span></button></td><td><StatusPill status={image.status} />{image.errorMessage && <span className="row-error" title={image.errorMessage}><AlertCircle size={14} /></span>}</td><td><strong>{formatBytes(image.sourceSize)}</strong><small>{image.width && image.height ? `${image.width} × ${image.height}` : image.extension.toUpperCase()}</small></td><td><strong>{formatBytes(image.outputSize)}</strong><small>{formatTime(image.compressedAt)}</small></td><td>{image.savedRatio == null ? <span className="muted">-</span> : <strong className="saved-value">-{(image.savedRatio * 100).toFixed(1)}%</strong>}</td><td><span className="muted">{formatTime(image.sourceMtime)}</span></td><td><div className="row-actions">{image.retryItemId && <button className="secondary-button retry-button" onClick={() => retryItem.mutate(image.retryItemId!)} disabled={retryItem.isPending || !usage.canCompress}><RotateCcw size={13} />重新压缩</button>}<button className="icon-button mini" onClick={() => removeImages.mutate({ ids: [image.id] })} disabled={!canRemove || removeImages.isPending} title="移出待压缩列表"><Trash2 size={14} /></button></div></td></tr>;
                 })}
               </tbody>
             </table>
@@ -571,7 +657,7 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
             <div className="list-progress-stat stat-failed"><span>失败</span><strong>{summary?.failed ?? 0}</strong></div>
           </footer>
         </section>
-        <JobPanel jobs={jobsQuery.data?.items ?? []} usage={usage} refreshingUsage={refreshingUsage} onRefreshUsage={onRefreshUsage} />
+        <JobPanel jobs={jobsQuery.data?.items ?? []} usage={usage} keys={keys} refreshingUsage={refreshingUsage} switchingKey={switchingKey} onRefreshUsage={onRefreshUsage} onActivateKey={onActivateKey} />
       </main>
       {preview && <PreviewDialog image={preview} capabilities={capabilities} onClose={() => setPreview(null)} />}
     </div>
@@ -581,20 +667,49 @@ function Workspace({ settings, capabilities, usage, refreshingUsage, onRefreshUs
 export function App() {
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: () => api<SettingsResponse>("/api/settings") });
   const capabilitiesQuery = useQuery({ queryKey: ["capabilities"], queryFn: () => api<DesktopCapabilities>("/api/platform/capabilities"), staleTime: Infinity });
+  const keysQuery = useQuery({ queryKey: ["tinypng-keys"], queryFn: () => api<TinyPngKeyListResponse>("/api/tinypng/keys") });
   const usageQuery = useQuery({ queryKey: ["tinypng-usage"], queryFn: () => api<TinyPngUsage>("/api/tinypng/usage"), refetchInterval: 60_000 });
   const queryClient = useQueryClient();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shutdownStatus, setShutdownStatus] = useState<ApplicationStatus | null>(null);
   const [shutdownPhase, setShutdownPhase] = useState<"idle" | "stopping" | "stopped">("idle");
+  const [keyActionError, setKeyActionError] = useState<unknown>(null);
   const usageRefresh = useMutation({
     mutationFn: () => api<TinyPngUsage>("/api/tinypng/usage/refresh", { method: "POST", body: "{}" }),
+    onMutate: () => setKeyActionError(null),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["tinypng-usage"] }),
         queryClient.invalidateQueries({ queryKey: ["jobs"] }),
         queryClient.invalidateQueries({ queryKey: ["settings"] })
       ]);
-    }
+    },
+    onError: setKeyActionError
+  });
+  const keyRefresh = useMutation({
+    mutationFn: (keyId: string) => api<TinyPngUsage>(`/api/tinypng/keys/${keyId}/refresh`, { method: "POST", body: "{}" }),
+    onMutate: () => setKeyActionError(null),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["tinypng-keys"] }),
+        queryClient.invalidateQueries({ queryKey: ["tinypng-usage"] }),
+        queryClient.invalidateQueries({ queryKey: ["settings"] })
+      ]);
+    },
+    onError: setKeyActionError
+  });
+  const activateKey = useMutation({
+    mutationFn: (keyId: string) => api<TinyPngKeyView>("/api/tinypng/keys/active", { method: "PUT", body: JSON.stringify({ keyId }) }),
+    onMutate: () => setKeyActionError(null),
+    onSuccess: async (result) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["tinypng-keys"] }),
+        queryClient.invalidateQueries({ queryKey: ["tinypng-usage"] }),
+        queryClient.invalidateQueries({ queryKey: ["settings"] })
+      ]);
+      if (result.stale) keyRefresh.mutate(result.id);
+    },
+    onError: setKeyActionError
   });
   const autoRefreshKey = useRef<string | null>(null);
   useEffect(() => {
@@ -630,13 +745,14 @@ export function App() {
   });
   const requestShutdown = () => shutdownStatusMutation.mutate();
   if (shutdownPhase !== "idle") return <ShutdownState stopped={shutdownPhase === "stopped"} />;
-  if (settingsQuery.isLoading || capabilitiesQuery.isLoading) return <div className="full-loading"><div className="brand-mark"><ImageIcon size={24} /></div><LoaderCircle className="spin" size={22} /><span>正在启动本地工作台</span></div>;
+  if (settingsQuery.isLoading || capabilitiesQuery.isLoading || keysQuery.isLoading) return <div className="full-loading"><div className="brand-mark"><ImageIcon size={24} /></div><LoaderCircle className="spin" size={22} /><span>正在启动本地工作台</span></div>;
   if (settingsQuery.error || !settingsQuery.data) return <div className="fatal-state"><AlertCircle size={30} /><h1>无法连接本地服务</h1><p>{settingsQuery.error instanceof Error ? settingsQuery.error.message : "请重新启动应用"}</p></div>;
-  const usage = usageQuery.data ?? { configured: settingsQuery.data.apiKey.configured, used: null, limit: TINYPNG_FREE_MONTHLY_LIMIT, remaining: null, status: "unknown", updatedAt: null, stale: true, source: null };
+  const keys = keysQuery.data ?? { items: [], activeKeyId: null };
+  const usage = usageQuery.data ?? { keyId: settingsQuery.data.apiKey.activeKeyId, keyName: settingsQuery.data.apiKey.activeKeyName, configured: settingsQuery.data.apiKey.configured, used: null, limit: TINYPNG_FREE_MONTHLY_LIMIT, remaining: null, status: "unknown", canCompress: settingsQuery.data.apiKey.canCompress, lastValidationStatus: settingsQuery.data.apiKey.lastValidationStatus, updatedAt: null, stale: true, source: null };
   return <>
     {!settingsQuery.data.configured
-      ? <SettingsPanel settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} usage={usage} refreshingUsage={usageRefresh.isPending} onRefreshUsage={() => usageRefresh.mutate()} onRequestShutdown={requestShutdown} />
-      : <><Workspace settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} usage={usage} refreshingUsage={usageRefresh.isPending} onRefreshUsage={() => usageRefresh.mutate()} onOpenSettings={() => setSettingsOpen(true)} onRequestShutdown={requestShutdown} />{settingsOpen && <SettingsPanel settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} usage={usage} refreshingUsage={usageRefresh.isPending} onRefreshUsage={() => usageRefresh.mutate()} onClose={() => setSettingsOpen(false)} onRequestShutdown={requestShutdown} />}</>}
+      ? <SettingsPanel settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} keys={keys} refreshingKeyId={keyRefresh.isPending ? keyRefresh.variables ?? null : null} keyActionError={keyActionError} onRefreshKey={(keyId) => keyRefresh.mutate(keyId)} onClearKeyActionError={() => setKeyActionError(null)} onRequestShutdown={requestShutdown} />
+      : <><Workspace settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} usage={usage} keys={keys} refreshingUsage={usageRefresh.isPending} switchingKey={activateKey.isPending} keyActionError={keyActionError} onRefreshUsage={() => usageRefresh.mutate()} onActivateKey={(keyId) => activateKey.mutate(keyId)} onClearKeyActionError={() => setKeyActionError(null)} onOpenSettings={() => setSettingsOpen(true)} onRequestShutdown={requestShutdown} />{settingsOpen && <SettingsPanel settings={settingsQuery.data} capabilities={capabilitiesQuery.data!} keys={keys} refreshingKeyId={keyRefresh.isPending ? keyRefresh.variables ?? null : null} keyActionError={keyActionError} onRefreshKey={(keyId) => keyRefresh.mutate(keyId)} onClearKeyActionError={() => setKeyActionError(null)} onClose={() => setSettingsOpen(false)} onRequestShutdown={requestShutdown} />}</>}
     {shutdownStatus && <ShutdownDialog
       status={shutdownStatus}
       pending={shutdownMutation.isPending}

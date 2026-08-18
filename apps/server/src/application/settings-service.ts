@@ -5,9 +5,7 @@ import { ulid } from "ulid";
 import type { OutputConflictStrategy, SettingsResponse, UpdateSettingsRequest } from "@ica/contracts";
 import { AppError } from "../errors.js";
 import { PathPolicy } from "../infrastructure/path-policy.js";
-import type { SecretStore } from "../infrastructure/secret-store.js";
-import type { TinyPngKeyValidation } from "../infrastructure/tinypng-adapter.js";
-import { TinyPngUsageService } from "./tinypng-usage-service.js";
+import { TinyPngKeyService } from "./tinypng-key-service.js";
 
 export interface StoredSettings {
   sourceDir: string;
@@ -29,9 +27,8 @@ export class SettingsService {
   constructor(
     private readonly appDataDir: string,
     private readonly db: Database.Database,
-    private readonly secrets: SecretStore,
-    private readonly pathPolicy: PathPolicy,
-    private readonly usage: TinyPngUsageService
+    private readonly keys: TinyPngKeyService,
+    private readonly pathPolicy: PathPolicy
   ) {
     this.settingsPath = path.join(appDataDir, "settings.json");
   }
@@ -71,7 +68,7 @@ export class SettingsService {
     this.defaultOutputDir = path.resolve(defaultOutputDir);
     const existing = await this.load();
     if (existing) {
-      if (existing.autoCompressOnImport && !(await this.secrets.hasTinyPngKey())) {
+      if (existing.autoCompressOnImport && !(await this.keys.hasActiveKey())) {
         await this.setAutoCompressOnImport(false);
       }
       return;
@@ -84,14 +81,14 @@ export class SettingsService {
       recursive: true,
       compressionConcurrency: 2,
       conflictStrategy: "suffix",
-      createOutputDir: true,
-      apiKeyAction: "keep"
+      createOutputDir: true
     });
   }
 
   async getResponse(): Promise<SettingsResponse> {
     const settings = await this.load();
-    const usage = this.db.prepare("SELECT * FROM api_usage WHERE id = 1").get() as any;
+    const active = this.keys.activeRow();
+    const hasActiveKey = await this.keys.hasActiveKey();
     return {
       configured: settings !== null,
       outputMode: settings?.outputMode ?? "automatic",
@@ -102,17 +99,15 @@ export class SettingsService {
       compressionConcurrency: settings?.compressionConcurrency ?? 2,
       conflictStrategy: settings?.conflictStrategy ?? "suffix",
       apiKey: {
-        configured: await this.secrets.hasTinyPngKey(),
-        lastValidationStatus: usage.last_validation_status,
-        lastValidatedAt: usage.last_validated_at,
-        compressionCount: usage.compression_count
+        configured: hasActiveKey,
+        activeKeyId: active?.id ?? null,
+        activeKeyName: active?.name ?? null,
+        canCompress: Boolean(hasActiveKey && active?.last_validation_status === "valid" && active.quota_state !== "exhausted"),
+        lastValidationStatus: active?.last_validation_status ?? "unknown",
+        lastValidatedAt: active?.last_validated_at ?? null,
+        compressionCount: active?.compression_count ?? null
       }
     };
-  }
-
-  async testKey(candidate?: string): Promise<TinyPngKeyValidation> {
-    if (candidate?.trim()) return this.usage.validateCandidate(candidate.trim());
-    return (await this.usage.refresh()).validation;
   }
 
   async update(input: UpdateSettingsRequest): Promise<SettingsResponse> {
@@ -146,13 +141,6 @@ export class SettingsService {
       }
     }
 
-    let replacementValidation: TinyPngKeyValidation | null = null;
-    if (input.apiKeyAction === "replace") {
-      if (!input.apiKey?.trim()) throw new AppError("API_KEY_REQUIRED", "请输入新的 TinyPNG API Key");
-      replacementValidation = await this.usage.validateCandidate(input.apiKey.trim());
-      if (!replacementValidation.valid) throw new AppError("INVALID_API_KEY", "TinyPNG API Key 无效");
-    }
-
     const next: StoredSettings = {
       sourceDir: roots.sourceDir,
       outputMode: input.outputMode,
@@ -162,19 +150,13 @@ export class SettingsService {
       compressionConcurrency: input.compressionConcurrency,
       conflictStrategy: input.conflictStrategy
     };
-    const previousKey = input.apiKeyAction === "replace" ? await this.secrets.getTinyPngKey() : null;
     await fs.mkdir(this.appDataDir, { recursive: true, mode: 0o700 });
     const temporary = `${this.settingsPath}.${ulid()}.tmp`;
     try {
       await fs.writeFile(temporary, JSON.stringify(next, null, 2), { encoding: "utf8", mode: 0o600, flag: "wx" });
-      if (input.apiKeyAction === "replace" && input.apiKey) await this.secrets.setTinyPngKey(input.apiKey);
       await fs.rename(temporary, this.settingsPath);
     } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => undefined);
-      if (input.apiKeyAction === "replace") {
-        if (previousKey) await this.secrets.setTinyPngKey(previousKey);
-        else await this.secrets.deleteTinyPngKey();
-      }
       if (currentSettings) {
         await fs.writeFile(this.settingsPath, JSON.stringify(currentSettings, null, 2), { encoding: "utf8", mode: 0o600 });
       } else {
@@ -200,16 +182,7 @@ export class SettingsService {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
       ).run(ulid(), next.sourceDir, roots.sourceRealPath, next.outputDir, roots.outputRealPath, Number(next.recursive), next.compressionConcurrency, 0, 0, next.conflictStrategy, now, now);
     }
-    if (replacementValidation) this.usage.recordValidation(replacementValidation);
     return this.getResponse();
-  }
-
-  async deleteKey(): Promise<void> {
-    const running = this.db.prepare("SELECT COUNT(*) AS count FROM job_items WHERE status = 'running'").get() as { count: number };
-    if (running.count > 0) throw new AppError("ACTIVE_JOBS", "仍有压缩任务运行，完成后再删除 API Key", 409);
-    await this.setAutoCompressOnImport(false);
-    await this.secrets.deleteTinyPngKey();
-    this.usage.clear();
   }
 
   setSessionOutputDirectoryProvider(provider: () => string | null): void {
@@ -223,7 +196,7 @@ export class SettingsService {
   private async setAutoCompressOnImportLocked(enabled: boolean): Promise<SettingsResponse> {
     const current = await this.load();
     if (!current) throw new AppError("SETTINGS_REQUIRED", "应用尚未完成初始化", 409);
-    if (enabled && !(await this.secrets.hasTinyPngKey())) {
+    if (enabled && !(await this.keys.hasActiveKey())) {
       throw new AppError("API_KEY_REQUIRED", "请先在设置中配置 TinyPNG API Key", 409);
     }
     if (current.autoCompressOnImport === enabled) return this.getResponse();

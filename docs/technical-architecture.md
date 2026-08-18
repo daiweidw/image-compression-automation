@@ -2,8 +2,8 @@
 
 ## 1. 文档信息
 
-- 文档版本：v3.0
-- 更新日期：2026-08-14
+- 文档版本：v3.1
+- 更新日期：2026-08-18
 - 关联需求：[需求文档](./requirements.md)
 - 当前架构：Electron 桌面应用 + Fastify 本机服务 + React 页面
 
@@ -11,7 +11,7 @@
 
 - 待压缩列表是本次会话状态，不是原图目录的镜像。
 - 原图来源按文件记录，可从多个目录加入；原图始终只读。
-- 设置只保存默认结果目录、递归扫描、并发、冲突策略和 API Key 状态。
+- 设置只保存默认结果目录、递归扫描、并发和冲突策略；TinyPNG Key 由独立 Key 服务管理。
 - 每个新批次拥有独立输出根目录，失败项只允许用户显式重新提交。
 - SQLite 与 REST 是权威状态，SSE 只发送“状态有变化”的通知。
 - 自动化与打包默认离线，任何缺失缓存都应明确失败。
@@ -30,10 +30,13 @@ flowchart LR
     API --> Images["ImageService"]
     API --> Jobs["JobService"]
     API --> Usage["TinyPngUsageService"]
+    API --> Keys["TinyPngKeyService"]
     Scanner --> DB[("SQLite schema v5")]
     Images --> DB
     Jobs --> DB
     Usage --> DB
+    Keys --> DB
+    Keys --> Secret
     Jobs --> Tiny["TinyPNG HTTPS"]
     Jobs --> Output["安全结果写入器"]
 ```
@@ -85,11 +88,13 @@ interface ScanRequest {
 - 扫描是否递归。
 - 压缩并发数。
 - 输出冲突策略。
-- TinyPNG API Key。
+- 多个 TinyPNG API Key、当前 Key 及每个 Key 的独立额度。
 
 `SessionOutputService` 管理当前应用会话的默认输出目录。自动模式下，第一次有效任务创建时在 Downloads 下独占创建 `图片压缩_YYYY-MM-DD_HH-mm-ss`，冲突时追加 `-2`、`-3`；本次会话后续手动和自动任务复用该目录。自定义模式直接使用用户目录。首个任务事务落库失败时，只删除仍为空且未被其他任务引用的会话目录。
 
 每个 `compression_jobs.output_root_path` 固定记录批次根目录，每个 `job_items.output_relative_path` 固定记录该图片在批次内的路径。多来源重名由 `uniqueOutputPaths()` 添加数字后缀。失败项手动重压时复用原批次根目录，但创建新的任务记录。
+
+每个 `compression_jobs` 同时保存创建时的 `tinypng_key_id` 和名称快照。切换当前 Key 不改变已有任务；失败项重压会创建新任务，因此绑定重试时的当前 Key。
 
 `OutputWriter` 按输出根目录串行化最终文件名选择和原子提交，TinyPNG 网络请求仍按配置并发。这样多个单图自动任务写入同一目录时不会因“检查后重命名”的竞争窗口覆盖文件。
 
@@ -117,7 +122,7 @@ stateDiagram-v2
 
 `JobService.execute()` 对 TinyPNG 只调用一次，不包含退避或自动重试循环。失败写入错误码和消息后结束该项。`POST /api/job-items/:id/retry` 仅接受 `failed` 项，并由用户操作创建一个单项新任务。
 
-额度服务在任务创建前和领取队列时执行熔断。额度耗尽或 Key 无效时，剩余 `queued` 项批量写为 `failed`；额度刷新不会重新入队。
+额度服务在任务创建前和领取队列时按 Key 执行熔断。额度耗尽、Key 无效或密钥缺失时，只有相同 `tinypng_key_id` 的 `queued` 项批量写为 `failed`；其他 Key 继续调度，额度刷新不会重新入队。
 
 关闭应用时，排队项标为取消，运行请求通过 `AbortController` 中止，随后关闭 Fastify、执行 WAL checkpoint 并关闭数据库。下次启动删除旧任务。
 
@@ -133,7 +138,9 @@ SQLite schema v5 的关键表：
 | `compression_jobs` | 当前会话批次及独立输出根目录 |
 | `job_items` | 批次内图片、状态、错误与输出相对路径 |
 | `compression_records` | 结果校验、预览和源哈希关联 |
-| `api_usage` | TinyPNG 额度快照与验证状态 |
+| `tinypng_api_keys` | Key 名称、当前 Key 和非敏感元数据 |
+| `tinypng_api_usage` | 每个 Key 的额度快照与验证状态 |
+| `api_usage` | 旧单 Key 额度迁移来源，v6 停止业务写入 |
 
 旧数据库中的 `watch_enabled` 与 `auto_compress` 迁移后统一写为 `0`，业务契约不再读写这两个字段。新的 `autoCompressOnImport` 与 `outputMode` 保存在 `settings.json`，避免与旧目录监听语义混淆。数据库中不得产生 `paused`、`awaiting_resume` 或 `awaiting_quota` 状态。
 
@@ -143,7 +150,7 @@ SQLite schema v5 的关键表：
 - 所有源文件使用 `lstat`/`realpath` 校验，不跟随符号链接。
 - 输出路径通过统一路径策略限制在批次根目录内。
 - 输出先写入随机临时文件，校验长度、类型和哈希后原子重命名。
-- API Key 完整值仅在主进程安全存储与后端调用期间存在，不进入 DTO、SQLite 或日志。
+- API Key 按服务端生成的 Key ID 分文件加密；完整值仅在主进程安全存储与后端调用期间存在，不进入 DTO、SQLite 或日志。
 - Electron 页面只允许导航到本机运行时 origin；外部 HTTPS 链接交给系统浏览器。
 
 ## 9. 固定离线测试区

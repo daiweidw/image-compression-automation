@@ -74,11 +74,36 @@ CREATE TABLE IF NOT EXISTS compression_records (
   compressed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tinypng_api_keys (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  normalized_name TEXT NOT NULL UNIQUE,
+  is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tinypng_api_usage (
+  key_id TEXT PRIMARY KEY REFERENCES tinypng_api_keys(id) ON DELETE CASCADE,
+  compression_count INTEGER,
+  quota_limit INTEGER NOT NULL DEFAULT 500,
+  quota_state TEXT NOT NULL DEFAULT 'unknown',
+  usage_source TEXT,
+  usage_period TEXT,
+  exhausted_at TEXT,
+  last_error_code TEXT,
+  last_validation_status TEXT NOT NULL DEFAULT 'unknown',
+  last_validated_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS compression_jobs (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   client_request_id TEXT NOT NULL,
   output_root_path TEXT,
+  tinypng_key_id TEXT REFERENCES tinypng_api_keys(id) ON DELETE SET NULL,
+  tinypng_key_name TEXT,
   status TEXT NOT NULL,
   total INTEGER NOT NULL DEFAULT 0,
   succeeded INTEGER NOT NULL DEFAULT 0,
@@ -129,6 +154,8 @@ CREATE INDEX IF NOT EXISTS idx_images_workspace_path ON image_entries(workspace_
 CREATE INDEX IF NOT EXISTS idx_images_workspace_present ON image_entries(workspace_id, present);
 CREATE INDEX IF NOT EXISTS idx_job_items_status ON job_items(status, queued_at);
 CREATE INDEX IF NOT EXISTS idx_job_items_image ON job_items(image_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_tinypng_key
+ON tinypng_api_keys(is_active) WHERE is_active = 1;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_image_job
 ON job_items(image_id) WHERE status IN ('queued', 'running');
 `;
@@ -147,6 +174,8 @@ function migrate(db: Database.Database): void {
     ensureColumn(db, "image_entries", "source_absolute_path", "TEXT");
     ensureColumn(db, "compression_records", "output_root_path", "TEXT");
     ensureColumn(db, "compression_jobs", "output_root_path", "TEXT");
+    ensureColumn(db, "compression_jobs", "tinypng_key_id", "TEXT REFERENCES tinypng_api_keys(id) ON DELETE SET NULL");
+    ensureColumn(db, "compression_jobs", "tinypng_key_name", "TEXT");
     ensureColumn(db, "job_items", "output_relative_path", "TEXT");
     ensureColumn(db, "api_usage", "quota_limit", "INTEGER NOT NULL DEFAULT 500");
     ensureColumn(db, "api_usage", "quota_state", "TEXT NOT NULL DEFAULT 'unknown'");
@@ -168,8 +197,22 @@ function migrate(db: Database.Database): void {
     db.exec("DROP INDEX IF EXISTS idx_one_active_image_job");
     db.exec(`CREATE UNIQUE INDEX idx_one_active_image_job
       ON job_items(image_id) WHERE status IN ('queued', 'running')`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_tinypng_key
+      ON compression_jobs(tinypng_key_id, status)`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_tinypng_key
+      ON tinypng_api_keys(is_active) WHERE is_active = 1`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS prevent_active_tinypng_key_delete
+      BEFORE DELETE ON tinypng_api_keys
+      WHEN EXISTS (
+        SELECT 1 FROM compression_jobs cj
+        JOIN job_items ji ON ji.job_id=cj.id
+        WHERE cj.tinypng_key_id=OLD.id AND ji.status IN ('queued','running')
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'TINyPNG_KEY_IN_USE');
+      END`);
     db.prepare(
-      `INSERT INTO app_meta (key, value) VALUES ('schema_version', '5')
+      `INSERT INTO app_meta (key, value) VALUES ('schema_version', '6')
        ON CONFLICT(key) DO UPDATE SET value=excluded.value`
     ).run();
   });

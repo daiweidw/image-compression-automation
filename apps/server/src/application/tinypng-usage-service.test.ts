@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDatabase } from "../infrastructure/database.js";
 import { FileSecretStore } from "../infrastructure/secret-store.js";
 import { TinyPngUsageService } from "./tinypng-usage-service.js";
+import { TinyPngKeyService } from "./tinypng-key-service.js";
 
 const directories: string[] = [];
 
@@ -18,16 +19,17 @@ describe("TinyPngUsageService", () => {
     directories.push(root);
     const db = await openDatabase(root);
     const secrets = new FileSecretStore(root);
-    await secrets.setTinyPngKey("test-key");
     const validateKey = vi.fn(async () => ({ valid: true, compressionCount: 420, quotaExceeded: false }));
+    const keys = new TinyPngKeyService(db, secrets, { validateKey: async () => ({ valid: true, compressionCount: 0, quotaExceeded: false }) });
+    const key = await keys.create("测试账号", "test-key");
     const usage = new TinyPngUsageService(db, secrets, { validateKey });
 
-    const refreshed = await usage.refresh();
+    const refreshed = await usage.refresh(key.id);
     expect(refreshed.usage).toMatchObject({ used: 420, limit: 500, remaining: 80, status: "warning", stale: false, source: "validation" });
-    db.prepare("UPDATE api_usage SET usage_period='2026-07', updated_at='2026-07-31T23:00:00.000Z' WHERE id=1").run();
-    await expect(usage.getUsage()).resolves.toMatchObject({ used: 420, stale: true });
-    usage.recordQuotaExhausted(null);
-    await expect(usage.getUsage()).resolves.toMatchObject({ used: 500, remaining: 0, status: "exhausted", source: "compression" });
+    db.prepare("UPDATE tinypng_api_usage SET usage_period='2026-07',updated_at='2026-07-31T23:00:00.000Z' WHERE key_id=?").run(key.id);
+    await expect(usage.getUsage(key.id)).resolves.toMatchObject({ used: 420, stale: true });
+    usage.recordQuotaExhausted(key.id, null);
+    await expect(usage.getUsage(key.id)).resolves.toMatchObject({ used: 500, remaining: 0, status: "exhausted", source: "compression" });
     expect(validateKey).toHaveBeenCalledTimes(1);
     db.close();
   });

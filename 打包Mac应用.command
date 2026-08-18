@@ -4,16 +4,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 finish() {
-  local status="$1"
+  local exit_code="$1"
   echo
-  if [ "$status" -eq 0 ]; then
+  if [ "$exit_code" -eq 0 ]; then
     echo "Mac 应用打包完成。"
   else
     echo "Mac 应用打包失败，请根据上方信息处理后重试。"
   fi
   echo "按回车键关闭窗口。"
   read -r
-  exit "$status"
+  exit "$exit_code"
 }
 
 echo "========================================"
