@@ -259,8 +259,8 @@ export async function buildApp(
       query: z.string().optional(),
       status: z.string().optional(),
       format: z.string().optional(),
-      sort: z.enum(["filename", "sourceSize", "sourceMtime", "compressedAt", "savedRatio"]).default("filename"),
-      order: z.enum(["asc", "desc"]).default("asc")
+      sort: z.enum(["addedAt", "filename", "sourceSize", "sourceMtime", "compressedAt", "savedRatio"]).default("addedAt"),
+      order: z.enum(["asc", "desc"]).default("desc")
     }).parse(request.query);
     const statuses = query.status?.split(",").filter((item): item is (typeof imageStatuses)[number] => imageStatuses.includes(item as any));
     return ok(request, await services.images.list({
@@ -295,6 +295,11 @@ export async function buildApp(
       z.object({ all: z.literal(true) })
     ]).parse(request.body);
     const removed = "all" in body ? services.images.clear() : services.images.remove(body.ids);
+    publish("images.changed");
+    return ok(request, { removed });
+  });
+  app.delete("/api/images/completed", async (request) => {
+    const removed = await services.images.clearCompleted();
     publish("images.changed");
     return ok(request, { removed });
   });

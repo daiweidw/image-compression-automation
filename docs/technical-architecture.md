@@ -73,9 +73,9 @@ interface ScanRequest {
 
 `ScannerService` 对输入路径做规范化和边界检查，遍历目录、过滤隐藏项与符号链接、读取元数据并计算源哈希。每张图片把真实绝对路径写入 `source_absolute_path`，列表显示通过 `present=1` 派生。
 
-后续扫描采用追加语义。相同规范绝对路径生成稳定键并去重；不同目录的同名文件仍是不同项。`POST /api/scans/stop` 触发 `AbortController`，停止后不回滚已经入库的项。
+后续扫描采用追加语义。相同规范绝对路径生成稳定键并去重；不同目录的同名文件仍是不同项。图片在首次进入当前列表或被移除后重新加入时记录 `added_batch_order` 和 `added_order`，默认按新批次优先、批内发现顺序展示；重复扫描仍在列表中的图片不会改变位置。`POST /api/scans/stop` 触发 `AbortController`，停止后不回滚已经入库的项。
 
-`DELETE /api/images` 通过 `present=0` 从本次列表移除图片。存在 `queued` 或 `running` 任务的图片拒绝移除。
+`DELETE /api/images` 通过 `present=0` 从本次列表移除图片。`DELETE /api/images/completed` 复用完整状态推导，只软移除当前确认为 `compressed` 的记录，不删除原图、输出文件或批次。存在 `queued` 或 `running` 任务的图片拒绝移除。
 
 ## 5. 设置与输出
 

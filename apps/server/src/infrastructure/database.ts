@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS image_entries (
   last_seen_scan_id TEXT,
   scan_error_code TEXT,
   scan_error_message TEXT,
+  added_batch_order INTEGER NOT NULL DEFAULT 0,
+  added_order INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(workspace_id, relative_path_key)
@@ -172,6 +174,8 @@ function migrate(db: Database.Database): void {
     ensureColumn(db, "workspaces", "conflict_strategy", "TEXT NOT NULL DEFAULT 'overwrite'");
     ensureColumn(db, "scan_runs", "source_label", "TEXT");
     ensureColumn(db, "image_entries", "source_absolute_path", "TEXT");
+    ensureColumn(db, "image_entries", "added_batch_order", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "image_entries", "added_order", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "compression_records", "output_root_path", "TEXT");
     ensureColumn(db, "compression_jobs", "output_root_path", "TEXT");
     ensureColumn(db, "compression_jobs", "tinypng_key_id", "TEXT REFERENCES tinypng_api_keys(id) ON DELETE SET NULL");
@@ -199,6 +203,8 @@ function migrate(db: Database.Database): void {
       ON job_items(image_id) WHERE status IN ('queued', 'running')`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_tinypng_key
       ON compression_jobs(tinypng_key_id, status)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_images_added_order
+      ON image_entries(workspace_id, present, added_batch_order DESC, added_order ASC)`);
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_tinypng_key
       ON tinypng_api_keys(is_active) WHERE is_active = 1`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS prevent_active_tinypng_key_delete
@@ -212,7 +218,7 @@ function migrate(db: Database.Database): void {
         SELECT RAISE(ABORT, 'TINyPNG_KEY_IN_USE');
       END`);
     db.prepare(
-      `INSERT INTO app_meta (key, value) VALUES ('schema_version', '6')
+      `INSERT INTO app_meta (key, value) VALUES ('schema_version', '7')
        ON CONFLICT(key) DO UPDATE SET value=excluded.value`
     ).run();
   });

@@ -17,7 +17,11 @@ describe("database migrations", () => {
     legacy.close();
     const db = await openDatabase(root);
     expect(db.prepare("SELECT id,watch_enabled,auto_compress,conflict_strategy FROM workspaces").get()).toEqual({ id: "legacy", watch_enabled: 0, auto_compress: 0, conflict_strategy: "overwrite" });
-    expect(db.prepare("SELECT value FROM app_meta WHERE key='schema_version'").get()).toEqual({ value: "6" });
+    expect(db.prepare("SELECT value FROM app_meta WHERE key='schema_version'").get()).toEqual({ value: "7" });
+    const imageColumns = db.prepare("PRAGMA table_info(image_entries)").all() as Array<{ name: string }>;
+    expect(imageColumns.map(({ name }) => name)).toEqual(expect.arrayContaining(["added_batch_order", "added_order"]));
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_images_added_order'").get())
+      .toEqual({ name: "idx_images_added_order" });
     db.close();
   });
 

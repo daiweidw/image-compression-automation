@@ -380,11 +380,12 @@ function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switc
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   const [format, setFormat] = useState("");
-  const [sort, setSort] = useState("filename");
+  const [sort, setSort] = useState("addedAt");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [preview, setPreview] = useState<ImageItem | null>(null);
   const [dragTarget, setDragTarget] = useState<"import" | "list" | null>(null);
   const [error, setError] = useState<unknown>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const tableScrollRef = useRef<HTMLDivElement>(null);
   const params = new URLSearchParams({ page: "1", pageSize: "5000", sort, order: sort === "filename" ? "asc" : "desc" });
   if (query) params.set("query", query);
@@ -465,6 +466,17 @@ function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switc
     },
     onError: setError
   });
+  const clearCompleted = useMutation({
+    mutationFn: () => api<{ removed: number }>("/api/images/completed", { method: "DELETE" }),
+    onSuccess: async ({ removed }) => {
+      const completedIds = new Set((imagesQuery.data?.items ?? []).filter((item) => item.status === "compressed").map((item) => item.id));
+      setSelected((current) => new Set([...current].filter((id) => !completedIds.has(id))));
+      setError(null);
+      setNotice(`已清除 ${removed} 条已压缩记录`);
+      await queryClient.invalidateQueries({ queryKey: ["images"] });
+    },
+    onError: setError
+  });
   const retryItem = useMutation({ mutationFn: (id: string) => api<JobView>(`/api/job-items/${id}/retry`, { method: "POST", body: "{}" }), onSuccess: () => queryClient.invalidateQueries(), onError: setError });
   const chooseOutput = useMutation({
     mutationFn: async () => {
@@ -518,6 +530,11 @@ function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switc
     }
   });
   const images = useMemo(() => imagesQuery.data?.items ?? [], [imagesQuery.data?.items]);
+  useEffect(() => {
+    if (!notice) return;
+    const timeout = window.setTimeout(() => setNotice(null), 3_000);
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
   const rowVirtualizer = useVirtualizer({ count: images.length, getScrollElement: () => tableScrollRef.current, estimateSize: () => 64, overscan: 8 });
   const selectable = images.filter((item) => compressibleStatuses.has(item.status));
   useEffect(() => {
@@ -594,6 +611,7 @@ function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switc
       <main className="workspace-layout">
         <section className="library-section">
           {error !== null && <ErrorBanner error={error} onClose={() => setError(null)} />}
+          {error === null && notice && <div className="success-banner workspace-notice" role="status"><Check size={17} />{notice}</div>}
           {error === null && keyActionError !== null && <ErrorBanner error={keyActionError} onClose={onClearKeyActionError} />}
           {usage.status === "exhausted" && <div className="quota-alert" role="alert"><AlertCircle size={18} /><div><strong>{usage.keyName ?? "当前 Key"} 本月免费额度已用尽</strong><span>切换到其他可用 Key 后，可手动重新压缩失败项。</span></div><button className="secondary-button" onClick={onOpenSettings}><KeyRound size={15} />切换 Key</button></div>}
           <div
@@ -604,7 +622,7 @@ function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switc
             onDrop={handleDrop}
           >
             <div className="import-zone-copy"><div className="import-icon"><Upload size={21} /></div><div><strong>拖入图片或文件夹</strong><span>支持 PNG、JPEG、WebP、AVIF</span></div></div>
-            <div className="import-actions"><button className="primary-button" onClick={() => scanFolder.mutate()} disabled={scanFolder.isPending || scanQuery.data?.status === "running"}>{scanFolder.isPending ? <LoaderCircle className="spin" size={16} /> : <FolderSearch size={16} />}扫描文件夹</button>{(imagesQuery.data?.total ?? 0) > 0 && <button className="secondary-button" onClick={() => window.confirm("确定清空本次待压缩列表？原文件不会被删除。") && removeImages.mutate({ all: true })} disabled={removeImages.isPending}>清空列表</button>}</div>
+            <div className="import-actions"><button className="primary-button" onClick={() => scanFolder.mutate()} disabled={scanFolder.isPending || scanQuery.data?.status === "running"}>{scanFolder.isPending ? <LoaderCircle className="spin" size={16} /> : <FolderSearch size={16} />}扫描文件夹</button>{(imagesQuery.data?.total ?? 0) > 0 && <button className="danger-button" onClick={() => window.confirm("确定清空本次待压缩列表？原文件和压缩结果不会被删除。") && removeImages.mutate({ all: true })} disabled={removeImages.isPending || clearCompleted.isPending}>清空全部</button>}</div>
           </div>
           <div className="output-location"><div className="output-location-label"><Download size={16} /><span>保存到</span></div><strong title={settings.sessionOutputDir ?? settings.outputDir}>{settings.sessionOutputDir ?? settings.outputDir}</strong><span className="output-hint">{settings.outputMode === "custom" ? "直接保存到此目录" : settings.sessionOutputDir ? "本次应用打开期间共用此目录" : "首次压缩时创建时间文件夹"}</span>{settings.outputMode === "custom" && <button className="text-button" onClick={() => restoreDefaultOutput.mutate()} disabled={restoreDefaultOutput.isPending}>恢复默认</button>}<button className="secondary-button" onClick={() => chooseOutput.mutate()} disabled={chooseOutput.isPending || restoreDefaultOutput.isPending}>{chooseOutput.isPending ? <LoaderCircle className="spin" size={15} /> : <FolderOpen size={15} />}更改</button></div>
           {scanQuery.data?.status === "running" && <div className="scan-progress" role="status"><LoaderCircle className="spin" size={17} /><div><strong>正在扫描 {scanQuery.data.sourceLabel}</strong><span>已发现 {scanQuery.data.discoveredCount}，已处理 {scanQuery.data.processedCount}{scanQuery.data.warningCount > 0 ? `，跳过 ${scanQuery.data.warningCount}` : ""}</span></div><button className="secondary-button" onClick={() => stopScan.mutate()} disabled={stopScan.isPending}>{stopScan.isPending ? <LoaderCircle className="spin" size={15} /> : <X size={15} />}停止扫描</button></div>}
@@ -622,7 +640,8 @@ function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switc
             <div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名或路径" /></div>
             <select aria-label="状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">全部状态</option>{Object.entries(statusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
             <select aria-label="格式筛选" value={format} onChange={(event) => setFormat(event.target.value)}><option value="">全部格式</option><option value="png">PNG</option><option value="jpg,jpeg">JPEG</option><option value="webp">WebP</option><option value="avif">AVIF</option></select>
-            <select aria-label="排序" value={sort} onChange={(event) => setSort(event.target.value)}><option value="filename">文件名</option><option value="sourceSize">文件大小</option><option value="sourceMtime">更新时间</option><option value="compressedAt">压缩时间</option><option value="savedRatio">节省比例</option></select>
+            <select aria-label="排序" value={sort} onChange={(event) => setSort(event.target.value)}><option value="addedAt">最新加入</option><option value="filename">文件名</option><option value="sourceSize">文件大小</option><option value="sourceMtime">更新时间</option><option value="compressedAt">压缩时间</option><option value="savedRatio">节省比例</option></select>
+            <button className="secondary-button clear-completed-button" onClick={() => window.confirm(`确定从列表中移除 ${summary?.compressed ?? 0} 条已压缩记录？原图和压缩结果不会被删除。`) && clearCompleted.mutate()} disabled={(summary?.compressed ?? 0) === 0 || clearCompleted.isPending || removeImages.isPending} title="清除所有已压缩记录"><Trash2 size={15} />清除已完成 ({summary?.compressed ?? 0})</button>
           </div>
 
           {(selected.size > 0 || selectable.length > 0) && <div className="selection-bar"><span>已选择 <strong>{selected.size}</strong> 张</span><button className="text-button" onClick={() => void selectAllFiltered()}>选择全部筛选结果</button>{selected.size > 0 && <><button className="text-button" onClick={() => setSelected(new Set())}>取消选择</button><button className="danger-text-button" onClick={() => removeImages.mutate({ ids: [...selected] })} disabled={removeImages.isPending}><Trash2 size={14} />移出列表</button></>}<button className="primary-button" onClick={startCompression} disabled={selected.size === 0 || compress.isPending || !usage.canCompress}>{compress.isPending ? <LoaderCircle className="spin" size={16} /> : !usage.canCompress ? <AlertCircle size={16} /> : <Sparkles size={16} />}{!usage.configured ? "先配置 API Key" : usage.status === "exhausted" ? "切换 API Key" : !usage.canCompress ? "当前 Key 不可用" : "开始压缩"}</button></div>}
@@ -644,7 +663,7 @@ function Workspace({ settings, capabilities, usage, keys, refreshingUsage, switc
                   const image = images[virtualRow.index]!;
                   const canSelect = compressibleStatuses.has(image.status);
                   const canRemove = !["queued", "compressing"].includes(image.status);
-                  return <tr key={image.id} data-index={virtualRow.index} style={{ transform: `translateY(${virtualRow.start}px)` }} className={selected.has(image.id) ? "selected-row" : ""}><td><input type="checkbox" aria-label={`选择 ${image.filename}`} disabled={!canSelect} checked={selected.has(image.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(image.id)) next.delete(image.id); else next.add(image.id); return next; })} /></td><td><button className="image-cell" onClick={() => setPreview(image)}><img src={`/api/images/${image.id}/thumbnail`} alt="" loading="lazy" /><span><strong title={image.filename}>{image.filename}</strong><small title={image.sourceDirectory}>{image.relativePath}</small></span></button></td><td><StatusPill status={image.status} />{image.errorMessage && <span className="row-error" title={image.errorMessage}><AlertCircle size={14} /></span>}</td><td><strong>{formatBytes(image.sourceSize)}</strong><small>{image.width && image.height ? `${image.width} × ${image.height}` : image.extension.toUpperCase()}</small></td><td><strong>{formatBytes(image.outputSize)}</strong><small>{formatTime(image.compressedAt)}</small></td><td>{image.savedRatio == null ? <span className="muted">-</span> : <strong className="saved-value">-{(image.savedRatio * 100).toFixed(1)}%</strong>}</td><td><span className="muted">{formatTime(image.sourceMtime)}</span></td><td><div className="row-actions">{image.retryItemId && <button className="secondary-button retry-button" onClick={() => retryItem.mutate(image.retryItemId!)} disabled={retryItem.isPending || !usage.canCompress}><RotateCcw size={13} />重新压缩</button>}<button className="icon-button mini" onClick={() => removeImages.mutate({ ids: [image.id] })} disabled={!canRemove || removeImages.isPending} title="移出待压缩列表"><Trash2 size={14} /></button></div></td></tr>;
+                  return <tr key={image.id} data-index={virtualRow.index} style={{ transform: `translateY(${virtualRow.start}px)` }} className={selected.has(image.id) ? "selected-row" : ""}><td><input type="checkbox" aria-label={`选择 ${image.filename}`} disabled={!canSelect} checked={selected.has(image.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(image.id)) next.delete(image.id); else next.add(image.id); return next; })} /></td><td><button className="image-cell" onClick={() => setPreview(image)}><img src={`/api/images/${image.id}/thumbnail`} alt="" loading="lazy" /><span><strong title={image.filename}>{image.filename}</strong><small title={image.sourceDirectory}>{image.relativePath}</small></span></button></td><td><StatusPill status={image.status} />{image.errorMessage && <span className="row-error" title={image.errorMessage}><AlertCircle size={14} /></span>}</td><td><strong>{formatBytes(image.sourceSize)}</strong><small>{image.width && image.height ? `${image.width} × ${image.height}` : image.extension.toUpperCase()}</small></td><td><strong>{formatBytes(image.outputSize)}</strong><small>{formatTime(image.compressedAt)}</small></td><td>{image.savedRatio == null ? <span className="muted">-</span> : <strong className="saved-value">-{(image.savedRatio * 100).toFixed(1)}%</strong>}</td><td><span className="muted">{formatTime(image.sourceMtime)}</span></td><td><div className="row-actions">{image.retryItemId && <button className="secondary-button retry-button" onClick={() => retryItem.mutate(image.retryItemId!)} disabled={retryItem.isPending || !usage.canCompress}><RotateCcw size={13} />重新压缩</button>}<button className="icon-button mini" onClick={() => removeImages.mutate({ ids: [image.id] })} disabled={!canRemove || removeImages.isPending || clearCompleted.isPending} title="移出待压缩列表"><Trash2 size={14} /></button></div></td></tr>;
                 })}
               </tbody>
             </table>

@@ -161,3 +161,25 @@ describe("automatic compression settings API", () => {
     expect(services.settings.setAutoCompressOnImport).toHaveBeenCalledWith(true);
   });
 });
+
+describe("completed image cleanup API", () => {
+  it("protects the mutation and delegates status-aware cleanup", async () => {
+    const services = fakeServices();
+    services.images = { clearCompleted: vi.fn(async () => 12) } as any;
+    const app = await buildApp(services);
+    apps.push(app);
+
+    const rejected = await app.inject({ method: "DELETE", url: "/api/images/completed" });
+    expect(rejected.statusCode).toBe(403);
+    const session = await app.inject({ method: "GET", url: "/api/session" });
+    const accepted = await app.inject({
+      method: "DELETE",
+      url: "/api/images/completed",
+      headers: { "x-local-app-token": session.json().data.token, origin: "http://127.0.0.1:43127" }
+    });
+
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json().data).toEqual({ removed: 12 });
+    expect(services.images.clearCompleted).toHaveBeenCalledTimes(1);
+  });
+});

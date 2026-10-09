@@ -71,3 +71,54 @@ test("renames an API key inline without browser prompt dialogs", async ({ page }
   await expect(failedEdit).toHaveValue("重复名称");
   expect(renameRequests).toBe(2);
 });
+
+test("defaults to newest imports and clears only completed list records", async ({ page }) => {
+  const baseItem = {
+    relativePath: "source/image.png", sourceDirectory: "/tmp/source", extension: "png", mimeType: "image/png",
+    width: 20, height: 20, sourceSize: 100, sourceMtime: "2026-08-26T00:00:00.000Z",
+    compressedAt: null, outputSize: null, savedBytes: null, savedRatio: null,
+    errorCode: null, errorMessage: null, retryItemId: null
+  };
+  let items = [
+    { ...baseItem, id: "completed", filename: "completed.png", status: "compressed", compressedAt: "2026-08-26T01:00:00.000Z", outputSize: 60, savedBytes: 40, savedRatio: 0.4 },
+    { ...baseItem, id: "pending", filename: "pending.png", status: "pending" }
+  ];
+  let initialQuery = "";
+  await page.route("**/api/images**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() === "DELETE" && url.pathname === "/api/images/completed") {
+      items = items.filter((item) => item.status !== "compressed");
+      await route.fulfill({ json: { data: { removed: 1 }, meta: { requestId: "test" } } });
+      return;
+    }
+    if (request.method() === "GET" && url.pathname === "/api/images") {
+      if (!initialQuery) initialQuery = url.search;
+      const compressed = items.filter((item) => item.status === "compressed").length;
+      const pending = items.filter((item) => item.status === "pending").length;
+      await route.fulfill({ json: {
+        data: {
+          items, page: 1, pageSize: 5000, total: items.length,
+          summary: { pending, queued: 0, compressing: 0, compressed, source_changed: 0, output_missing: 0, failed: 0, unsupported: 0, sourceBytes: items.length * 100, outputBytes: compressed * 60, savedBytes: compressed * 40 }
+        },
+        meta: { requestId: "test" }
+      } });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await expect(page.getByLabel("排序")).toHaveValue("addedAt");
+  expect(initialQuery).toContain("sort=addedAt");
+  expect(initialQuery).toContain("order=desc");
+  await expect(page.getByText("completed.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("pending.png", { exact: true })).toBeVisible();
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "清除已完成 (1)" }).click();
+  await expect(page.getByText("completed.png", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("pending.png", { exact: true })).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("已清除 1 条已压缩记录");
+  await expect(page.getByRole("button", { name: "清除已完成 (0)" })).toBeDisabled();
+});

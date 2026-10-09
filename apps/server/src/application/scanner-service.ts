@@ -174,6 +174,10 @@ export class ScannerService {
     let discoveredCount = 0;
     let processedCount = 0;
     let warningCount = 0;
+    let addedOrder = 0;
+    const batchOrder = (this.db.prepare(
+      "SELECT COALESCE(MAX(added_batch_order), 0) + 1 AS value FROM image_entries WHERE workspace_id=?"
+    ).get(workspace.id) as { value: number }).value;
     const seen = new Set<string>();
     const updateProgress = () => {
       this.db.prepare("UPDATE scan_runs SET discovered_count=?, processed_count=?, warning_count=? WHERE id=?")
@@ -199,6 +203,8 @@ export class ScannerService {
         const existing = this.db.prepare(
           "SELECT id, source_size, source_mtime_ns, source_hash, present FROM image_entries WHERE workspace_id=? AND relative_path_key=?"
         ).get(workspace.id, absoluteKey) as any;
+        const newlyAdded = existing?.present !== 1;
+        const itemAddedOrder = newlyAdded ? addedOrder++ : 0;
 
         let imageEvent: ScanImageEvent | null = null;
         try {
@@ -217,20 +223,23 @@ export class ScannerService {
             `INSERT INTO image_entries (
               id, workspace_id, relative_path, relative_path_key, source_absolute_path, filename, extension, mime_type,
               width, height, source_size, source_mtime_ns, source_hash, supported, present,
-              last_seen_scan_id, scan_error_code, scan_error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, ?, ?)
+              last_seen_scan_id, scan_error_code, scan_error_message, added_batch_order, added_order, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, ?, ?, ?, ?)
             ON CONFLICT(workspace_id, relative_path_key) DO UPDATE SET
               relative_path=excluded.relative_path, source_absolute_path=excluded.source_absolute_path,
               filename=excluded.filename, extension=excluded.extension, mime_type=excluded.mime_type,
               width=excluded.width, height=excluded.height, source_size=excluded.source_size,
               source_mtime_ns=excluded.source_mtime_ns, source_hash=excluded.source_hash,
-              supported=excluded.supported, present=1, last_seen_scan_id=excluded.last_seen_scan_id,
+              supported=excluded.supported,
+              added_batch_order=CASE WHEN image_entries.present=0 THEN excluded.added_batch_order ELSE image_entries.added_batch_order END,
+              added_order=CASE WHEN image_entries.present=0 THEN excluded.added_order ELSE image_entries.added_order END,
+              present=1, last_seen_scan_id=excluded.last_seen_scan_id,
               scan_error_code=NULL, scan_error_message=NULL, updated_at=excluded.updated_at`
           ).run(imageId, workspace.id, discovered.displayPath, absoluteKey, discovered.absolutePath,
             path.basename(discovered.absolutePath), path.extname(discovered.absolutePath).slice(1).toLowerCase(),
             format ? `image/${format === "jpeg" ? "jpeg" : format}` : null, metadata.width ?? null,
-            metadata.height ?? null, size, mtimeNs, hash, Number(supported), id, now, now);
-          if (supported) imageEvent = { scanId: id, imageId, newlyAdded: existing?.present !== 1 };
+            metadata.height ?? null, size, mtimeNs, hash, Number(supported), id, batchOrder, itemAddedOrder, now, now);
+          if (supported) imageEvent = { scanId: id, imageId, newlyAdded };
         } catch (error) {
           if (signal.aborted) throw error;
           warningCount += 1;
@@ -239,15 +248,18 @@ export class ScannerService {
             `INSERT INTO image_entries (
               id, workspace_id, relative_path, relative_path_key, source_absolute_path, filename, extension, mime_type,
               width, height, source_size, source_mtime_ns, source_hash, supported, present,
-              last_seen_scan_id, scan_error_code, scan_error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, '0', NULL, 0, 1, ?, 'SCAN_ERROR', ?, ?, ?)
-            ON CONFLICT(workspace_id, relative_path_key) DO UPDATE SET present=1,
+              last_seen_scan_id, scan_error_code, scan_error_message, added_batch_order, added_order, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, '0', NULL, 0, 1, ?, 'SCAN_ERROR', ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, relative_path_key) DO UPDATE SET
+              added_batch_order=CASE WHEN image_entries.present=0 THEN excluded.added_batch_order ELSE image_entries.added_batch_order END,
+              added_order=CASE WHEN image_entries.present=0 THEN excluded.added_order ELSE image_entries.added_order END,
+              present=1,
               source_absolute_path=excluded.source_absolute_path, supported=0,
               last_seen_scan_id=excluded.last_seen_scan_id, scan_error_code='SCAN_ERROR',
               scan_error_message=excluded.scan_error_message, updated_at=excluded.updated_at`
           ).run(imageId, workspace.id, discovered.displayPath, absoluteKey, discovered.absolutePath,
             path.basename(discovered.absolutePath), path.extname(discovered.absolutePath).slice(1).toLowerCase(),
-            id, errorMessage(error), now, now);
+            id, errorMessage(error), batchOrder, itemAddedOrder, now, now);
         }
         if (imageEvent) await this.onImage(imageEvent).catch(() => undefined);
         processedCount += 1;

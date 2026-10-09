@@ -14,7 +14,7 @@ export interface ImageListOptions {
   query?: string;
   statuses?: ImageStatus[];
   formats?: string[];
-  sort: "filename" | "sourceSize" | "sourceMtime" | "compressedAt" | "savedRatio";
+  sort: "addedAt" | "filename" | "sourceSize" | "sourceMtime" | "compressedAt" | "savedRatio";
   order: "asc" | "desc";
 }
 
@@ -117,6 +117,7 @@ export class ImageService {
     ).all(workspace.id) as any[];
 
     const items: ImageItem[] = [];
+    const addedPositions = new Map<string, { batch: number; order: number }>();
     for (const row of rows) {
       const outputValid = await this.outputValid(workspace, row);
       const status = deriveImageStatus({
@@ -149,6 +150,7 @@ export class ImageService {
         errorMessage: row.scan_error_message ?? row.error_message,
         retryItemId: status === "failed" ? row.last_job_item_id ?? null : null
       });
+      addedPositions.set(row.id, { batch: row.added_batch_order, order: row.added_order });
     }
 
     const summary = {
@@ -181,6 +183,14 @@ export class ImageService {
 
     const direction = options.order === "asc" ? 1 : -1;
     filtered.sort((a, b) => {
+      if (options.sort === "addedAt") {
+        const left = addedPositions.get(a.id)!;
+        const right = addedPositions.get(b.id)!;
+        const batchComparison = (left.batch - right.batch) * direction;
+        if (batchComparison !== 0) return batchComparison;
+        const orderComparison = left.order - right.order;
+        return orderComparison !== 0 ? orderComparison : a.id.localeCompare(b.id);
+      }
       const values: Record<typeof options.sort, [string | number | null, string | number | null]> = {
         filename: [a.filename, b.filename],
         sourceSize: [a.sourceSize, b.sourceSize],
@@ -225,6 +235,31 @@ export class ImageService {
     if (active.count > 0) throw new AppError("IMAGE_JOB_ACTIVE", "任务进行中，暂时不能清空待压缩列表", 409);
     const workspace = this.workspace();
     return this.db.prepare("UPDATE image_entries SET present=0 WHERE workspace_id=? AND present=1").run(workspace.id).changes;
+  }
+
+  async clearCompleted(): Promise<number> {
+    const workspace = this.workspace();
+    const { items } = await this.filtered({
+      page: 1,
+      pageSize: 5_000,
+      statuses: ["compressed"],
+      sort: "addedAt",
+      order: "desc"
+    });
+    if (items.length === 0) return 0;
+
+    const removeOne = this.db.prepare(
+      `UPDATE image_entries SET present=0 WHERE id=? AND workspace_id=? AND present=1
+       AND NOT EXISTS (
+         SELECT 1 FROM job_items WHERE image_id=image_entries.id AND status IN ('queued','running')
+       )`
+    );
+    const removeCompleted = this.db.transaction((ids: string[]) => {
+      let removed = 0;
+      for (const id of ids) removed += removeOne.run(id, workspace.id).changes;
+      return removed;
+    });
+    return removeCompleted(items.map((item) => item.id));
   }
 
   async previewPath(id: string, variant: "source" | "output"): Promise<{ path: string; mimeType: string }> {
